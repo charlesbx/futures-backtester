@@ -167,15 +167,17 @@ def simulate_trade(
     strategy: IntradayMomentumStrategy,
     slippage_ticks: float = 1,
     commission: float = 1.24,
+    day_data: pd.DataFrame | None = None,
 ) -> Trade | None:
     """Simulate a single trade bar-by-bar.
 
     Args:
-        df: OHLCV 1-min DataFrame (Eastern Time index)
+        df: OHLCV 1-min DataFrame (Eastern Time index) — used if day_data not provided
         signal: Signal with entry/exit times and direction
         strategy: Strategy instance (for SL/TP parameters)
         slippage_ticks: Slippage in ticks per trade
         commission: Round-trip commission in dollars
+        day_data: Pre-sliced day data (optimization: avoids scanning full df)
 
     Returns:
         Trade object or None if entry bar not found
@@ -183,8 +185,12 @@ def simulate_trade(
     tick_size = INSTRUMENTS[signal.instrument]["tick_size"]
     tick_value = INSTRUMENTS[signal.instrument]["tick_value"]
 
-    # Get bars from entry to exit
-    trade_bars = df[(df.index >= signal.entry_time) & (df.index < signal.exit_time)]
+    # Get bars from entry to exit — use pre-sliced day_data if available
+    source = day_data if day_data is not None else df
+    day_times = source.index.time
+    entry_t = signal.entry_time.time() if hasattr(signal.entry_time, 'time') else signal.entry_time
+    exit_t = signal.exit_time.time() if hasattr(signal.exit_time, 'time') else signal.exit_time
+    trade_bars = source.loc[(day_times >= entry_t) & (day_times < exit_t)]
     if trade_bars.empty:
         return None
 
@@ -352,6 +358,57 @@ def _run_single_config(
     return metrics, trades
 
 
+def _precompute_morning_returns(
+    data: dict[str, pd.DataFrame],
+    signal_end_values: list[time],
+) -> dict[tuple[str, str], pd.DataFrame]:
+    """Precompute morning returns for each (instrument, signal_end).
+
+    Returns dict keyed by (instrument, signal_end_str) -> DataFrame with
+    columns: date, morning_return, open_price, close_price, and the day_data
+    index range for fast entry bar lookup.
+    """
+    cache = {}
+    signal_start = time(9, 30)  # always fixed
+
+    for instrument, df in data.items():
+        tz = df.index.tz
+        date_col = df.index.normalize()
+
+        # Group by date once
+        day_groups = {date: day_data for date, day_data in df.groupby(date_col)}
+
+        for sig_end in signal_end_values:
+            key = (instrument, sig_end.strftime("%H:%M"))
+            expected_bars = (sig_end.hour * 60 + sig_end.minute
+                             - signal_start.hour * 60 - signal_start.minute)
+            rows = []
+
+            for date, day_data in day_groups.items():
+                day_times = day_data.index.time
+
+                sig_mask = (day_times >= signal_start) & (day_times < sig_end)
+                signal_window = day_data.loc[sig_mask]
+
+                if len(signal_window) < expected_bars * 0.8:
+                    continue
+
+                open_price = signal_window.iloc[0]["open"]
+                close_price = signal_window.iloc[-1]["close"]
+                if open_price == 0:
+                    continue
+
+                morning_return = (close_price - open_price) / open_price
+                rows.append({
+                    "date": date,
+                    "morning_return": morning_return,
+                })
+
+            cache[key] = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["date", "morning_return"])
+
+    return cache
+
+
 def run_grid_search(
     data: dict[str, pd.DataFrame],
     param_grid: list[dict],
@@ -359,16 +416,84 @@ def run_grid_search(
 ) -> pd.DataFrame:
     """Run grid search over parameter combinations.
 
-    Returns DataFrame with one row per combination.
+    Precomputes morning returns for each (instrument, signal_end) to avoid
+    redundant signal scanning. 16 precomputations instead of 1,024.
     """
+    from .metrics import calculate_metrics
+
+    # Extract unique signal_end values for precomputation
+    signal_end_values = sorted(set(p["signal_end"] for p in param_grid),
+                                key=lambda t: (t.hour, t.minute))
+    print(f"  Precomputing morning returns for {len(signal_end_values)} signal_end values × {len(data)} instruments...")
+    morning_cache = _precompute_morning_returns(data, signal_end_values)
+
+    # Precompute day groups for fast trade simulation (avoids 2.4M-bar scan per trade)
+    print(f"  Precomputing day groups...")
+    day_groups = {}
+    for instrument, df in data.items():
+        day_groups[instrument] = {date: gdf for date, gdf in df.groupby(df.index.normalize())}
+
+    print(f"  Done. Running {len(param_grid)} parameter combinations...")
+
     results = []
     iterator = tqdm(param_grid, desc="Grid search") if progress else param_grid
 
     for params in iterator:
-        metrics, trades = _run_single_config(data, params)
+        sig_end_str = params["signal_end"].strftime("%H:%M")
+        entry_t = params["entry_time"]
+        exit_t = time(16, 0)
+        min_sig = params["min_signal_pct"]
+
+        strategy = IntradayMomentumStrategy(
+            signal_end=params["signal_end"],
+            entry_time=entry_t,
+            min_signal_pct=min_sig,
+            stop_loss_ticks=params["stop_loss_ticks"],
+            take_profit_ticks=params["take_profit_ticks"],
+        )
+
+        all_trades = []
+        for instrument, df in data.items():
+            tz = df.index.tz
+            returns_df = morning_cache.get((instrument, sig_end_str))
+            if returns_df is None or returns_df.empty:
+                continue
+
+            # Filter by min_signal_pct and build signals
+            for _, row in returns_df.iterrows():
+                mr = row["morning_return"]
+                if abs(mr) <= min_sig:
+                    continue
+
+                date = row["date"]
+                direction = "long" if mr > 0 else "short"
+
+                date_naive = pd.Timestamp(date.date()) if hasattr(date, 'date') else pd.Timestamp(date)
+                entry_ts = date_naive + pd.Timedelta(hours=entry_t.hour, minutes=entry_t.minute)
+                exit_ts = date_naive + pd.Timedelta(hours=exit_t.hour, minutes=exit_t.minute)
+                if tz is not None:
+                    entry_ts = entry_ts.tz_localize(tz)
+                    exit_ts = exit_ts.tz_localize(tz)
+
+                signal = Signal(
+                    date=date,
+                    direction=direction,
+                    signal_return=mr,
+                    entry_time=entry_ts,
+                    exit_time=exit_ts,
+                    instrument=instrument,
+                )
+
+                # Use precomputed day slice for fast simulation
+                dd = day_groups[instrument].get(date)
+                trade = simulate_trade(df, signal, strategy, day_data=dd)
+                if trade is not None:
+                    all_trades.append(trade)
+
+        metrics = calculate_metrics(all_trades)
 
         results.append({
-            "signal_end": params["signal_end"].strftime("%H:%M"),
+            "signal_end": sig_end_str,
             "entry_time": params["entry_time"].strftime("%H:%M"),
             "min_signal_pct": params["min_signal_pct"],
             "stop_loss_ticks": params["stop_loss_ticks"],
