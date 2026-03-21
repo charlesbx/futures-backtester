@@ -12,6 +12,7 @@ grid search, walk-forward analysis, and report generation.
 """
 
 import itertools
+import json
 from dataclasses import dataclass
 from datetime import time
 
@@ -854,3 +855,131 @@ def run_grid_search(
         })
 
     return pd.DataFrame(results)
+
+
+# ======================================================================
+# Walk-forward helpers
+# ======================================================================
+
+
+def _filter_data_by_date(
+    data: dict[str, pd.DataFrame],
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> dict[str, pd.DataFrame]:
+    """Filter all instrument DataFrames to a date range."""
+    return {
+        inst: df[(df.index >= start) & (df.index < end)]
+        for inst, df in data.items()
+    }
+
+
+# ======================================================================
+# Walk-forward analysis
+# ======================================================================
+
+
+def run_walk_forward(
+    data: dict[str, pd.DataFrame],
+    param_grid: list[dict],
+    train_months: int = 24,
+    test_months: int = 6,
+    top_n: int = 10,
+) -> pd.DataFrame:
+    """Rolling walk-forward analysis.
+
+    For each window:
+    1. Train: run grid search, select top_n by profit_factor (min 20 trades)
+    2. Test: evaluate top_n out-of-sample
+    3. Record IS and OOS metrics
+    """
+    from .metrics import calculate_metrics
+
+    tz = next(iter(data.values())).index.tz
+    global_start = max(df.index.min().date() for df in data.values())
+    global_end = min(df.index.max().date() for df in data.values())
+
+    # Build rolling windows
+    windows = []
+    current = global_start
+    while True:
+        train_start = pd.Timestamp(current, tz=tz)
+        train_end = train_start + pd.DateOffset(months=train_months)
+        test_start = train_end
+        test_end = test_start + pd.DateOffset(months=test_months)
+
+        if test_end.date() > global_end:
+            break
+
+        windows.append((train_start, train_end, test_start, test_end))
+        # Step by test_months — non-overlapping test windows, overlapping train windows
+        current = (train_start + pd.DateOffset(months=test_months)).date()
+
+    print(f"  {len(windows)} walk-forward windows")
+    wf_results = []
+
+    for wid, (train_start, train_end, test_start, test_end) in enumerate(windows):
+        print(f"\n  Window {wid}: train {train_start.date()}→{train_end.date()}, "
+              f"test {test_start.date()}→{test_end.date()}")
+
+        train_data = _filter_data_by_date(data, train_start, train_end)
+        test_data = _filter_data_by_date(data, test_start, test_end)
+
+        # In-sample grid search (no progress bar)
+        is_results = run_grid_search(train_data, param_grid)
+        if is_results.empty:
+            continue
+
+        # Filter: minimum 20 trades
+        qualified = is_results[is_results["total_trades"] >= 20]
+        if qualified.empty:
+            continue
+
+        # Select top N by profit factor
+        top_params = qualified.nlargest(top_n, "profit_factor")
+
+        # Evaluate OOS
+        for _, row in top_params.iterrows():
+            # Reconstruct params — convert string times back to time objects
+            h, m = map(int, row["asian_end"].split(":"))
+            ae = time(h, m)
+            h, m = map(int, row["trade_start"].split(":"))
+            ts = time(h, m)
+            h, m = map(int, row["trade_end"].split(":"))
+            te = time(h, m)
+
+            max_rt = None if pd.isna(row["max_range_ticks"]) else int(row["max_range_ticks"])
+
+            params = {
+                "mode": row["mode"],
+                "asian_end": ae,
+                "trade_start": ts,
+                "trade_end": te,
+                "min_range_ticks": int(row["min_range_ticks"]),
+                "max_range_ticks": max_rt,
+                "stop_type": row["stop_type"],
+                "tp_type": row["tp_type"],
+                "rr_ratio": float(row["rr_ratio"]),
+                "stop_multiple": float(row["stop_multiple"]),
+            }
+
+            strategy = AsianRangeStrategy(**params)
+            oos_trades = run_backtest(test_data, strategy)
+            oos_metrics = calculate_metrics(oos_trades)
+
+            wf_results.append({
+                "window_id": wid,
+                "train_start": train_start.date(),
+                "train_end": train_end.date(),
+                "test_start": test_start.date(),
+                "test_end": test_end.date(),
+                "params": json.dumps({k: str(v) for k, v in params.items()}),
+                "is_pnl": row["total_pnl"],
+                "oos_pnl": oos_metrics.get("total_pnl", 0),
+                "is_sharpe": row["sharpe_ratio"],
+                "oos_sharpe": oos_metrics.get("sharpe_ratio", 0),
+                "is_pf": row["profit_factor"],
+                "oos_pf": oos_metrics.get("profit_factor", 0),
+            })
+
+    return pd.DataFrame(wf_results)
