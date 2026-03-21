@@ -82,8 +82,8 @@ class AsianRangeStrategy:
         trade_end: Latest time; force-exit at this time (default 4:00 PM ET)
         min_range_ticks: Minimum range size in ticks to consider (default 10)
         max_range_ticks: Maximum range size in ticks (default None = no limit)
-        stop_type: 'range' (opposite side) or 'multiple' (stop_multiple * range)
-        tp_type: 'rr' (risk/reward ratio) or 'range_multiple'
+        stop_type: 'range' (opposite side of range) or 'multiple' (stop_multiple * range)
+        tp_type: 'rr' (risk/reward), 'opposite' (measured move / boundary), or 'midpoint'
         rr_ratio: Risk/reward ratio for take-profit (default 2.0)
         stop_multiple: Multiplier for stop distance when stop_type='multiple'
     """
@@ -114,6 +114,74 @@ class AsianRangeStrategy:
         self.tp_type = tp_type
         self.rr_ratio = rr_ratio
         self.stop_multiple = stop_multiple
+
+    # ------------------------------------------------------------------
+    # SL / TP computation
+    # ------------------------------------------------------------------
+
+    def compute_sl_tp(
+        self,
+        signal: "AsianSignal",
+        entry_price: float,
+    ) -> tuple[float, float]:
+        """Compute stop-loss and take-profit for a signal.
+
+        Args:
+            signal: The entry signal (contains direction, mode, asian_range)
+            entry_price: Actual entry price (after slippage)
+
+        Returns:
+            (stop_loss, take_profit) tuple
+        """
+        ar = signal.asian_range
+        range_size = ar.asian_high - ar.asian_low
+
+        # --- Stop-loss ---
+        if self.stop_type == "range":
+            # Opposite side of the Asian range
+            if signal.direction == "long":
+                sl = ar.asian_low
+            else:
+                sl = ar.asian_high
+        elif self.stop_type == "multiple":
+            if signal.direction == "long":
+                sl = entry_price - self.stop_multiple * range_size
+            else:
+                sl = entry_price + self.stop_multiple * range_size
+        else:
+            raise ValueError(f"Unknown stop_type: {self.stop_type!r}")
+
+        # --- Take-profit ---
+        risk_distance = abs(entry_price - sl)
+
+        if self.tp_type == "rr":
+            if signal.direction == "long":
+                tp = entry_price + self.rr_ratio * risk_distance
+            else:
+                tp = entry_price - self.rr_ratio * risk_distance
+        elif self.tp_type == "opposite":
+            if signal.mode == "breakout":
+                # Measured move: extend by one range_size beyond the boundary
+                if signal.direction == "long":
+                    tp = ar.asian_high + range_size
+                else:
+                    tp = ar.asian_low - range_size
+            else:
+                # Fade: target the opposite boundary
+                if signal.direction == "long":
+                    tp = ar.asian_high
+                else:
+                    tp = ar.asian_low
+        elif self.tp_type == "midpoint":
+            tp = (ar.asian_high + ar.asian_low) / 2
+        else:
+            raise ValueError(f"Unknown tp_type: {self.tp_type!r}")
+
+        return sl, tp
+
+    # ------------------------------------------------------------------
+    # Range detection
+    # ------------------------------------------------------------------
 
     def find_asian_ranges(
         self,
@@ -351,3 +419,129 @@ class AsianRangeStrategy:
                 )
 
         return None
+
+
+# ======================================================================
+# Trade simulation
+# ======================================================================
+
+
+def simulate_trade(
+    signal: AsianSignal,
+    day_data: pd.DataFrame,
+    strategy: AsianRangeStrategy,
+    tick_size: float,
+    tick_value: float,
+    slippage_ticks: float = 1,
+    commission: float = 1.24,
+) -> Trade | None:
+    """Simulate a single Asian range trade bar-by-bar.
+
+    Args:
+        signal: AsianSignal with direction, mode, entry_price, entry_time
+        day_data: Pre-sliced day OHLCV DataFrame (Eastern Time)
+        strategy: AsianRangeStrategy instance (for SL/TP params and trade_end)
+        tick_size: Instrument tick size (e.g. 0.25)
+        tick_value: Instrument tick value per tick (e.g. 1.25 for MES)
+        slippage_ticks: Slippage in ticks per side (default 1)
+        commission: Round-trip commission in dollars (default 1.24)
+
+    Returns:
+        Trade object or None if no bars in the trade window
+    """
+    ar = signal.asian_range
+
+    # Build trade window: entry_time to trade_end
+    entry_t = signal.entry_time
+    trade_end_t = strategy.trade_end
+
+    # Construct the trade_end timestamp on the signal's date
+    d = signal.date
+    tz = day_data.index.tz
+    trade_end_ts = pd.Timestamp(
+        year=d.year, month=d.month, day=d.day,
+        hour=trade_end_t.hour, minute=trade_end_t.minute,
+    )
+    if tz is not None:
+        trade_end_ts = trade_end_ts.tz_localize(tz)
+
+    # Filter bars from entry_time to trade_end
+    mask = (day_data.index >= entry_t) & (day_data.index < trade_end_ts)
+    trade_bars = day_data.loc[mask]
+    if trade_bars.empty:
+        return None
+
+    # Entry price with slippage
+    slippage = slippage_ticks * tick_size
+    if signal.direction == "long":
+        entry_price = signal.entry_price + slippage
+    else:
+        entry_price = signal.entry_price - slippage
+
+    # Compute SL/TP
+    sl, tp = strategy.compute_sl_tp(signal, entry_price)
+
+    # Walk bar-by-bar (skip entry bar)
+    exit_price = None
+    exit_time = None
+    exit_reason = "session_end"
+
+    for _, bar in trade_bars.iloc[1:].iterrows():
+        if signal.direction == "long":
+            # Check SL first (conservative: SL before TP on same bar)
+            if bar["low"] <= sl:
+                exit_price = sl
+                exit_time = bar.name
+                exit_reason = "sl"
+                break
+            # Check TP
+            if bar["high"] >= tp:
+                exit_price = tp
+                exit_time = bar.name
+                exit_reason = "tp"
+                break
+        else:
+            # Short: check SL first
+            if bar["high"] >= sl:
+                exit_price = sl
+                exit_time = bar.name
+                exit_reason = "sl"
+                break
+            # Check TP
+            if bar["low"] <= tp:
+                exit_price = tp
+                exit_time = bar.name
+                exit_reason = "tp"
+                break
+
+    # Forced exit at last bar close if no SL/TP hit
+    if exit_price is None:
+        last_bar = trade_bars.iloc[-1]
+        exit_price = last_bar["close"]
+        exit_time = last_bar.name
+
+    # PnL calculation
+    if signal.direction == "long":
+        pnl_ticks = (exit_price - entry_price) / tick_size
+    else:
+        pnl_ticks = (entry_price - exit_price) / tick_size
+
+    pnl_dollars = pnl_ticks * tick_value - commission
+
+    return Trade(
+        entry_time=trade_bars.iloc[0].name,
+        exit_time=exit_time,
+        direction=signal.direction,
+        entry_price=entry_price,
+        exit_price=exit_price,
+        stop_loss=sl,
+        take_profit=tp,
+        pnl_ticks=pnl_ticks,
+        pnl_dollars=pnl_dollars,
+        exit_reason=exit_reason,
+        session=0,
+        instrument=signal.instrument,
+        date=signal.date,
+        range_high=ar.asian_high,
+        range_low=ar.asian_low,
+    )

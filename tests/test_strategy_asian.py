@@ -1,4 +1,4 @@
-"""Tests for Asian Range strategy — range detection and data structures."""
+"""Tests for Asian Range strategy — range detection, signals, and trade simulation."""
 
 from datetime import time
 
@@ -12,6 +12,7 @@ from src.strategy_asian import (
     AsianRangeStrategy,
     AsianSignal,
     Trade,
+    simulate_trade,
 )
 
 
@@ -502,3 +503,369 @@ class TestConstants:
 
     def test_min_range_bars(self):
         assert MIN_RANGE_BARS == 5
+
+
+# ---------------------------------------------------------------------------
+# Helpers for SL/TP and trade simulation tests
+# ---------------------------------------------------------------------------
+
+
+def _make_range(
+    asian_high: float = 5010.0,
+    asian_low: float = 4990.0,
+) -> AsianRange:
+    """Build a standard AsianRange for testing."""
+    return AsianRange(
+        date=pd.Timestamp("2024-01-08"),
+        asian_high=asian_high,
+        asian_low=asian_low,
+        asian_start=pd.Timestamp("2024-01-07 18:00", tz=TZ),
+        asian_end=pd.Timestamp("2024-01-08 02:00", tz=TZ),
+        range_ticks=round((asian_high - asian_low) / TICK_SIZE_MES),
+        instrument="MES",
+    )
+
+
+def _make_signal(
+    direction: str = "long",
+    mode: str = "breakout",
+    entry_price: float | None = None,
+    asian_high: float = 5010.0,
+    asian_low: float = 4990.0,
+) -> AsianSignal:
+    """Build an AsianSignal for testing.
+
+    Default entry_price:
+        breakout long  -> asian_high
+        breakout short -> asian_low
+        fade long      -> asian_low + 1.0  (close above low)
+        fade short     -> asian_high - 1.0 (close below high)
+    """
+    ar = _make_range(asian_high=asian_high, asian_low=asian_low)
+
+    if entry_price is None:
+        if mode == "breakout":
+            entry_price = asian_high if direction == "long" else asian_low
+        else:
+            # Fade: entry at bar close near the boundary
+            entry_price = (asian_low + 1.0) if direction == "long" else (asian_high - 1.0)
+
+    return AsianSignal(
+        date=pd.Timestamp("2024-01-08"),
+        direction=direction,
+        mode=mode,
+        entry_price=entry_price,
+        entry_time=pd.Timestamp("2024-01-08 09:45", tz=TZ),
+        asian_range=ar,
+        instrument="MES",
+    )
+
+
+# ---------------------------------------------------------------------------
+# compute_sl_tp tests
+# ---------------------------------------------------------------------------
+
+
+class TestComputeSlTp:
+    """Tests for AsianRangeStrategy.compute_sl_tp()."""
+
+    def test_range_stop_breakout_long(self):
+        """stop_type='range', breakout long: SL = asian_low, TP via rr_ratio."""
+        sig = _make_signal(direction="long", mode="breakout")
+        # entry_price = asian_high = 5010.0
+        strategy = AsianRangeStrategy(
+            mode="breakout", stop_type="range", tp_type="rr",
+            rr_ratio=2.0, min_range_ticks=1,
+        )
+        entry = sig.entry_price + 0.25  # slippage applied externally
+        sl, tp = strategy.compute_sl_tp(sig, entry)
+
+        assert sl == 4990.0  # asian_low
+        risk = entry - sl  # 5010.25 - 4990.0 = 20.25
+        expected_tp = entry + 2.0 * risk
+        assert tp == pytest.approx(expected_tp)
+
+    def test_multiple_stop_fade_short(self):
+        """stop_type='multiple', fade short: SL = entry + 0.5 * range, TP = asian_low (opposite)."""
+        sig = _make_signal(direction="short", mode="fade")
+        # entry_price = asian_high - 1.0 = 5009.0
+        strategy = AsianRangeStrategy(
+            mode="fade", stop_type="multiple", tp_type="opposite",
+            stop_multiple=0.5, min_range_ticks=1,
+        )
+        entry = sig.entry_price - 0.25  # slippage for short
+        sl, tp = strategy.compute_sl_tp(sig, entry)
+
+        range_size = 5010.0 - 4990.0  # 20.0
+        expected_sl = entry + 0.5 * range_size  # 5008.75 + 10.0 = 5018.75
+        assert sl == pytest.approx(expected_sl)
+        # Fade short -> opposite boundary = asian_low
+        assert tp == 4990.0
+
+    def test_midpoint_tp(self):
+        """tp_type='midpoint': TP = (asian_high + asian_low) / 2."""
+        sig = _make_signal(direction="long", mode="breakout")
+        strategy = AsianRangeStrategy(
+            mode="breakout", stop_type="range", tp_type="midpoint",
+            min_range_ticks=1,
+        )
+        entry = sig.entry_price + 0.25
+        sl, tp = strategy.compute_sl_tp(sig, entry)
+
+        assert sl == 4990.0  # range stop
+        assert tp == pytest.approx((5010.0 + 4990.0) / 2)  # 5000.0
+
+    def test_opposite_tp_breakout_long(self):
+        """tp_type='opposite', breakout long: TP = asian_high + range_size (measured move)."""
+        sig = _make_signal(direction="long", mode="breakout")
+        strategy = AsianRangeStrategy(
+            mode="breakout", stop_type="range", tp_type="opposite",
+            min_range_ticks=1,
+        )
+        entry = sig.entry_price + 0.25
+        sl, tp = strategy.compute_sl_tp(sig, entry)
+
+        range_size = 5010.0 - 4990.0  # 20.0
+        assert tp == pytest.approx(5010.0 + range_size)  # 5030.0
+
+    def test_opposite_tp_breakout_short(self):
+        """tp_type='opposite', breakout short: TP = asian_low - range_size."""
+        sig = _make_signal(direction="short", mode="breakout")
+        strategy = AsianRangeStrategy(
+            mode="breakout", stop_type="range", tp_type="opposite",
+            min_range_ticks=1,
+        )
+        entry = sig.entry_price - 0.25
+        sl, tp = strategy.compute_sl_tp(sig, entry)
+
+        range_size = 5010.0 - 4990.0
+        assert tp == pytest.approx(4990.0 - range_size)  # 4970.0
+
+    def test_opposite_tp_fade_long(self):
+        """tp_type='opposite', fade long: TP = asian_high (opposite boundary)."""
+        sig = _make_signal(direction="long", mode="fade")
+        strategy = AsianRangeStrategy(
+            mode="fade", stop_type="range", tp_type="opposite",
+            min_range_ticks=1,
+        )
+        entry = sig.entry_price + 0.25
+        sl, tp = strategy.compute_sl_tp(sig, entry)
+
+        assert tp == 5010.0  # asian_high
+
+    def test_rr_ratio_short(self):
+        """RR ratio applied correctly for short direction."""
+        sig = _make_signal(direction="short", mode="breakout")
+        strategy = AsianRangeStrategy(
+            mode="breakout", stop_type="range", tp_type="rr",
+            rr_ratio=1.5, min_range_ticks=1,
+        )
+        entry = sig.entry_price - 0.25  # 4989.75
+        sl, tp = strategy.compute_sl_tp(sig, entry)
+
+        assert sl == 5010.0  # asian_high
+        risk = sl - entry  # 5010.0 - 4989.75 = 20.25
+        expected_tp = entry - 1.5 * risk
+        assert tp == pytest.approx(expected_tp)
+
+
+# ---------------------------------------------------------------------------
+# simulate_trade tests
+# ---------------------------------------------------------------------------
+
+
+class TestSimulateTrade:
+    """Tests for simulate_trade()."""
+
+    @staticmethod
+    def _make_trade_bars(
+        entry_time: str = "2024-01-08 09:45",
+        n_bars: int = 20,
+        base_price: float = 5010.0,
+        highs: list[float] | None = None,
+        lows: list[float] | None = None,
+        closes: list[float] | None = None,
+    ) -> pd.DataFrame:
+        """Build trade-window bars with controllable highs/lows/closes."""
+        idx = pd.date_range(entry_time, periods=n_bars, freq="1min", tz=TZ)
+        df = pd.DataFrame(
+            {
+                "open": base_price,
+                "high": base_price + 1.0,
+                "low": base_price - 1.0,
+                "close": base_price,
+                "volume": 100,
+            },
+            index=idx,
+        )
+        if highs is not None:
+            for i, h in enumerate(highs):
+                if h is not None and i < len(df):
+                    df.iloc[i, df.columns.get_loc("high")] = h
+        if lows is not None:
+            for i, lo in enumerate(lows):
+                if lo is not None and i < len(df):
+                    df.iloc[i, df.columns.get_loc("low")] = lo
+        if closes is not None:
+            for i, c in enumerate(closes):
+                if c is not None and i < len(df):
+                    df.iloc[i, df.columns.get_loc("close")] = c
+        return df
+
+    def test_long_tp_hit(self):
+        """Long trade hits TP on bar where high >= tp."""
+        sig = _make_signal(direction="long", mode="breakout")
+        strategy = AsianRangeStrategy(
+            mode="breakout", stop_type="range", tp_type="rr",
+            rr_ratio=2.0, min_range_ticks=1,
+        )
+        tick_size = 0.25
+        tick_value = 1.25
+        slippage = 1 * tick_size  # 0.25
+        entry = sig.entry_price + slippage  # 5010.25
+        sl_expected = 4990.0
+        risk = entry - sl_expected  # 20.25
+        tp_expected = entry + 2.0 * risk  # 5010.25 + 40.50 = 5050.75
+
+        # Build bars: bar 0 is entry, bars 1-4 normal, bar 5 high hits TP
+        highs = [None, None, None, None, None, tp_expected + 1.0]
+        day_data = self._make_trade_bars(highs=highs)
+
+        trade = simulate_trade(sig, day_data, strategy, tick_size, tick_value)
+
+        assert trade is not None
+        assert trade.exit_reason == "tp"
+        assert trade.exit_price == pytest.approx(tp_expected)
+        assert trade.direction == "long"
+        assert trade.pnl_ticks == pytest.approx((tp_expected - entry) / tick_size)
+        assert trade.range_high == 5010.0
+        assert trade.range_low == 4990.0
+        assert trade.session == 0
+
+    def test_short_sl_hit(self):
+        """Short trade hits SL when bar high >= sl."""
+        sig = _make_signal(direction="short", mode="breakout")
+        strategy = AsianRangeStrategy(
+            mode="breakout", stop_type="range", tp_type="rr",
+            rr_ratio=2.0, min_range_ticks=1,
+        )
+        tick_size = 0.25
+        tick_value = 1.25
+        entry = sig.entry_price - 0.25  # 4989.75
+        sl_expected = 5010.0  # asian_high
+
+        # Bar 3 high exceeds SL
+        highs = [None, None, None, sl_expected + 1.0]
+        day_data = self._make_trade_bars(base_price=4990.0, highs=highs)
+
+        trade = simulate_trade(sig, day_data, strategy, tick_size, tick_value)
+
+        assert trade is not None
+        assert trade.exit_reason == "sl"
+        assert trade.exit_price == pytest.approx(sl_expected)
+        pnl_ticks = (entry - sl_expected) / tick_size  # negative
+        assert trade.pnl_ticks == pytest.approx(pnl_ticks)
+
+    def test_session_end_exit(self):
+        """No SL or TP hit -> forced exit at last bar close."""
+        sig = _make_signal(direction="long", mode="breakout")
+        strategy = AsianRangeStrategy(
+            mode="breakout", stop_type="range", tp_type="rr",
+            rr_ratio=2.0, min_range_ticks=1,
+        )
+        tick_size = 0.25
+        tick_value = 1.25
+
+        # All bars stay well within SL/TP range
+        day_data = self._make_trade_bars(n_bars=10, base_price=5010.0)
+
+        trade = simulate_trade(sig, day_data, strategy, tick_size, tick_value)
+
+        assert trade is not None
+        assert trade.exit_reason == "session_end"
+        assert trade.exit_price == day_data.iloc[-1]["close"]
+
+    def test_sl_before_tp_same_bar(self):
+        """When both SL and TP could trigger on the same bar, SL wins (conservative)."""
+        sig = _make_signal(direction="long", mode="breakout")
+        strategy = AsianRangeStrategy(
+            mode="breakout", stop_type="range", tp_type="rr",
+            rr_ratio=2.0, min_range_ticks=1,
+        )
+        tick_size = 0.25
+        tick_value = 1.25
+        entry = sig.entry_price + 0.25  # 5010.25
+        sl_expected = 4990.0
+        risk = entry - sl_expected
+        tp_expected = entry + 2.0 * risk
+
+        # Bar 2: low hits SL AND high hits TP
+        highs = [None, None, tp_expected + 5.0]
+        lows = [None, None, sl_expected - 5.0]
+        day_data = self._make_trade_bars(highs=highs, lows=lows)
+
+        trade = simulate_trade(sig, day_data, strategy, tick_size, tick_value)
+
+        assert trade is not None
+        assert trade.exit_reason == "sl"  # SL checked first
+
+    def test_pnl_dollars_includes_commission(self):
+        """PnL dollars = pnl_ticks * tick_value - commission."""
+        sig = _make_signal(direction="long", mode="breakout")
+        strategy = AsianRangeStrategy(
+            mode="breakout", stop_type="range", tp_type="rr",
+            rr_ratio=2.0, min_range_ticks=1,
+        )
+        tick_size = 0.25
+        tick_value = 1.25
+        commission = 2.50
+
+        day_data = self._make_trade_bars(n_bars=5, base_price=5010.0)
+        trade = simulate_trade(
+            sig, day_data, strategy, tick_size, tick_value,
+            commission=commission,
+        )
+
+        assert trade is not None
+        expected_dollars = trade.pnl_ticks * tick_value - commission
+        assert trade.pnl_dollars == pytest.approx(expected_dollars)
+
+    def test_empty_bars_returns_none(self):
+        """No bars in trade window returns None."""
+        sig = _make_signal(direction="long", mode="breakout")
+        strategy = AsianRangeStrategy(
+            mode="breakout", min_range_ticks=1,
+            trade_end=time(9, 30),  # end before entry -> no bars
+        )
+        tick_size = 0.25
+        tick_value = 1.25
+
+        day_data = self._make_trade_bars(
+            entry_time="2024-01-08 09:45",
+            n_bars=10,
+        )
+        trade = simulate_trade(sig, day_data, strategy, tick_size, tick_value)
+        assert trade is None
+
+    def test_slippage_applied(self):
+        """Slippage is added for long, subtracted for short."""
+        sig_long = _make_signal(direction="long", mode="breakout")
+        sig_short = _make_signal(direction="short", mode="breakout")
+        strategy = AsianRangeStrategy(mode="breakout", min_range_ticks=1)
+        tick_size = 0.25
+        tick_value = 1.25
+
+        day_data = self._make_trade_bars(n_bars=10, base_price=5000.0)
+
+        trade_long = simulate_trade(
+            sig_long, day_data, strategy, tick_size, tick_value, slippage_ticks=2,
+        )
+        trade_short = simulate_trade(
+            sig_short, day_data, strategy, tick_size, tick_value, slippage_ticks=2,
+        )
+
+        assert trade_long is not None
+        assert trade_long.entry_price == sig_long.entry_price + 2 * tick_size
+
+        assert trade_short is not None
+        assert trade_short.entry_price == sig_short.entry_price - 2 * tick_size
