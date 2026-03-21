@@ -12,6 +12,7 @@ from src.strategy_asian import (
     AsianRangeStrategy,
     AsianSignal,
     Trade,
+    build_param_grid,
     simulate_trade,
 )
 
@@ -869,3 +870,26 @@ class TestSimulateTrade:
 
         assert trade_short is not None
         assert trade_short.entry_price == sig_short.entry_price - 2 * tick_size
+
+
+# ---------------------------------------------------------------------------
+# Parameter grid tests
+# ---------------------------------------------------------------------------
+
+
+class TestParamGrid:
+    """Tests for build_param_grid()."""
+
+    def test_grid_size(self):
+        """Grid must contain exactly 4,050 valid parameter combinations."""
+        grid = build_param_grid()
+        assert len(grid) == 4050
+
+    def test_no_fade_opposite_stop(self):
+        """No combination should have mode='fade' AND stop_type='opposite'."""
+        grid = build_param_grid()
+        fade_opposite = [
+            p for p in grid
+            if p["mode"] == "fade" and p["stop_type"] == "opposite"
+        ]
+        assert len(fade_opposite) == 0

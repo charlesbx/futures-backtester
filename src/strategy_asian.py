@@ -11,6 +11,7 @@ Provides Asian range detection, signal generation, trade simulation,
 grid search, walk-forward analysis, and report generation.
 """
 
+import itertools
 from dataclasses import dataclass
 from datetime import time
 
@@ -545,3 +546,136 @@ def simulate_trade(
         range_high=ar.asian_high,
         range_low=ar.asian_low,
     )
+
+
+# ======================================================================
+# Backtest runner
+# ======================================================================
+
+
+def run_backtest(
+    data: dict[str, pd.DataFrame],
+    strategy: AsianRangeStrategy,
+    slippage_ticks: float = 1,
+    commission: float = 1.24,
+) -> list[Trade]:
+    """Run the Asian Range strategy across multiple instruments.
+
+    Args:
+        data: Dict mapping instrument name (e.g. 'MES') to OHLCV DataFrame
+        strategy: Configured AsianRangeStrategy instance
+        slippage_ticks: Slippage in ticks per side (default 1)
+        commission: Round-trip commission in dollars (default 1.24)
+
+    Returns:
+        List of all Trade objects across all instruments
+    """
+    all_trades: list[Trade] = []
+
+    for instrument, df in data.items():
+        tick_size = INSTRUMENTS[instrument]["tick_size"]
+        tick_value = INSTRUMENTS[instrument]["tick_value"]
+
+        # Compute Asian ranges
+        ranges = strategy.find_asian_ranges(df, instrument, tick_size)
+
+        # Find signals
+        signals = strategy.find_signals(df, ranges)
+
+        # Precompute day groups for fast lookup
+        day_groups: dict[pd.Timestamp, pd.DataFrame] = {
+            date: gdf for date, gdf in df.groupby(df.index.normalize())
+        }
+
+        # Simulate each signal
+        for signal in signals:
+            day_data = day_groups.get(signal.date)
+            if day_data is None:
+                continue
+            trade = simulate_trade(
+                signal, day_data, strategy,
+                tick_size, tick_value,
+                slippage_ticks, commission,
+            )
+            if trade is not None:
+                all_trades.append(trade)
+
+    return all_trades
+
+
+# ======================================================================
+# Parameter grid
+# ======================================================================
+
+
+def build_param_grid() -> list[dict]:
+    """Build a grid of all valid parameter combinations.
+
+    Generates exactly 4,050 combinations:
+    - Breakout: 162 base x 15 exit combos = 2,430
+    - Fade: 162 base x 10 exit combos = 1,620
+    - Total: 4,050
+
+    CRITICAL: stop_type='opposite' is excluded when mode='fade'.
+    Fade entries are near the boundary, making opposite-side stops useless.
+
+    Returns:
+        List of dicts, each with all 10 parameter keys
+    """
+    modes = ["breakout", "fade"]
+    asian_ends = [time(0, 0), time(1, 0), time(2, 0)]
+    trade_starts = [time(8, 0), time(9, 0), time(9, 30)]
+    trade_ends = [time(12, 0), time(14, 0), time(16, 0)]
+    min_range_ticks_vals = [5, 10, 15]
+    max_range_ticks_vals = [75, None]
+
+    stop_types = ["opposite", "multiple"]
+    tp_types = ["rr", "opposite", "midpoint"]
+    rr_ratios = [1.0, 2.0, 3.0]
+    stop_multiples = [0.5, 1.0]
+
+    grid: list[dict] = []
+
+    base_combos = itertools.product(
+        modes, asian_ends, trade_starts, trade_ends,
+        min_range_ticks_vals, max_range_ticks_vals,
+    )
+
+    for mode, asian_end, trade_start, trade_end, min_rt, max_rt in base_combos:
+        # Build exit parameter combos
+        for stop_type in stop_types:
+            # CRITICAL: skip opposite stop for fade mode
+            if mode == "fade" and stop_type == "opposite":
+                continue
+
+            # Determine stop_multiple values
+            if stop_type == "multiple":
+                sm_values = stop_multiples
+            else:
+                # opposite stop: stop_multiple unused, use default
+                sm_values = [0.5]
+
+            for tp_type in tp_types:
+                # Determine rr_ratio values
+                if tp_type == "rr":
+                    rr_values = rr_ratios
+                else:
+                    # non-rr tp: rr_ratio unused, use default
+                    rr_values = [2.0]
+
+                for rr_ratio in rr_values:
+                    for stop_multiple in sm_values:
+                        grid.append({
+                            "mode": mode,
+                            "asian_end": asian_end,
+                            "trade_start": trade_start,
+                            "trade_end": trade_end,
+                            "min_range_ticks": min_rt,
+                            "max_range_ticks": max_rt,
+                            "stop_type": stop_type,
+                            "tp_type": tp_type,
+                            "rr_ratio": rr_ratio,
+                            "stop_multiple": stop_multiple,
+                        })
+
+    return grid
