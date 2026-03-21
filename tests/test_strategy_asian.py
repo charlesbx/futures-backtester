@@ -574,7 +574,7 @@ class TestComputeSlTp:
         sig = _make_signal(direction="long", mode="breakout")
         # entry_price = asian_high = 5010.0
         strategy = AsianRangeStrategy(
-            mode="breakout", stop_type="range", tp_type="rr",
+            mode="breakout", stop_type="opposite", tp_type="rr",
             rr_ratio=2.0, min_range_ticks=1,
         )
         entry = sig.entry_price + 0.25  # slippage applied externally
@@ -606,7 +606,7 @@ class TestComputeSlTp:
         """tp_type='midpoint': TP = (asian_high + asian_low) / 2."""
         sig = _make_signal(direction="long", mode="breakout")
         strategy = AsianRangeStrategy(
-            mode="breakout", stop_type="range", tp_type="midpoint",
+            mode="breakout", stop_type="opposite", tp_type="midpoint",
             min_range_ticks=1,
         )
         entry = sig.entry_price + 0.25
@@ -619,7 +619,7 @@ class TestComputeSlTp:
         """tp_type='opposite', breakout long: TP = asian_high + range_size (measured move)."""
         sig = _make_signal(direction="long", mode="breakout")
         strategy = AsianRangeStrategy(
-            mode="breakout", stop_type="range", tp_type="opposite",
+            mode="breakout", stop_type="opposite", tp_type="opposite",
             min_range_ticks=1,
         )
         entry = sig.entry_price + 0.25
@@ -632,7 +632,7 @@ class TestComputeSlTp:
         """tp_type='opposite', breakout short: TP = asian_low - range_size."""
         sig = _make_signal(direction="short", mode="breakout")
         strategy = AsianRangeStrategy(
-            mode="breakout", stop_type="range", tp_type="opposite",
+            mode="breakout", stop_type="opposite", tp_type="opposite",
             min_range_ticks=1,
         )
         entry = sig.entry_price - 0.25
@@ -645,7 +645,7 @@ class TestComputeSlTp:
         """tp_type='opposite', fade long: TP = asian_high (opposite boundary)."""
         sig = _make_signal(direction="long", mode="fade")
         strategy = AsianRangeStrategy(
-            mode="fade", stop_type="range", tp_type="opposite",
+            mode="fade", stop_type="opposite", tp_type="opposite",
             min_range_ticks=1,
         )
         entry = sig.entry_price + 0.25
@@ -657,7 +657,7 @@ class TestComputeSlTp:
         """RR ratio applied correctly for short direction."""
         sig = _make_signal(direction="short", mode="breakout")
         strategy = AsianRangeStrategy(
-            mode="breakout", stop_type="range", tp_type="rr",
+            mode="breakout", stop_type="opposite", tp_type="rr",
             rr_ratio=1.5, min_range_ticks=1,
         )
         entry = sig.entry_price - 0.25  # 4989.75
@@ -716,7 +716,7 @@ class TestSimulateTrade:
         """Long trade hits TP on bar where high >= tp."""
         sig = _make_signal(direction="long", mode="breakout")
         strategy = AsianRangeStrategy(
-            mode="breakout", stop_type="range", tp_type="rr",
+            mode="breakout", stop_type="opposite", tp_type="rr",
             rr_ratio=2.0, min_range_ticks=1,
         )
         tick_size = 0.25
@@ -746,7 +746,7 @@ class TestSimulateTrade:
         """Short trade hits SL when bar high >= sl."""
         sig = _make_signal(direction="short", mode="breakout")
         strategy = AsianRangeStrategy(
-            mode="breakout", stop_type="range", tp_type="rr",
+            mode="breakout", stop_type="opposite", tp_type="rr",
             rr_ratio=2.0, min_range_ticks=1,
         )
         tick_size = 0.25
@@ -770,7 +770,7 @@ class TestSimulateTrade:
         """No SL or TP hit -> forced exit at last bar close."""
         sig = _make_signal(direction="long", mode="breakout")
         strategy = AsianRangeStrategy(
-            mode="breakout", stop_type="range", tp_type="rr",
+            mode="breakout", stop_type="opposite", tp_type="rr",
             rr_ratio=2.0, min_range_ticks=1,
         )
         tick_size = 0.25
@@ -789,7 +789,7 @@ class TestSimulateTrade:
         """When both SL and TP could trigger on the same bar, SL wins (conservative)."""
         sig = _make_signal(direction="long", mode="breakout")
         strategy = AsianRangeStrategy(
-            mode="breakout", stop_type="range", tp_type="rr",
+            mode="breakout", stop_type="opposite", tp_type="rr",
             rr_ratio=2.0, min_range_ticks=1,
         )
         tick_size = 0.25
@@ -813,7 +813,7 @@ class TestSimulateTrade:
         """PnL dollars = pnl_ticks * tick_value - commission."""
         sig = _make_signal(direction="long", mode="breakout")
         strategy = AsianRangeStrategy(
-            mode="breakout", stop_type="range", tp_type="rr",
+            mode="breakout", stop_type="opposite", tp_type="rr",
             rr_ratio=2.0, min_range_ticks=1,
         )
         tick_size = 0.25

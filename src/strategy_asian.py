@@ -82,7 +82,7 @@ class AsianRangeStrategy:
         trade_end: Latest time; force-exit at this time (default 4:00 PM ET)
         min_range_ticks: Minimum range size in ticks to consider (default 10)
         max_range_ticks: Maximum range size in ticks (default None = no limit)
-        stop_type: 'range' (opposite side of range) or 'multiple' (stop_multiple * range)
+        stop_type: 'opposite' (opposite side of range, breakout only) or 'multiple' (stop_multiple * range)
         tp_type: 'rr' (risk/reward), 'opposite' (measured move / boundary), or 'midpoint'
         rr_ratio: Risk/reward ratio for take-profit (default 2.0)
         stop_multiple: Multiplier for stop distance when stop_type='multiple'
@@ -99,7 +99,7 @@ class AsianRangeStrategy:
         trade_end: time = time(16, 0),
         min_range_ticks: int = 10,
         max_range_ticks: int | None = None,
-        stop_type: str = "range",
+        stop_type: str = "opposite",
         tp_type: str = "rr",
         rr_ratio: float = 2.0,
         stop_multiple: float = 1.0,
@@ -137,7 +137,7 @@ class AsianRangeStrategy:
         range_size = ar.asian_high - ar.asian_low
 
         # --- Stop-loss ---
-        if self.stop_type == "range":
+        if self.stop_type == "opposite":
             # Opposite side of the Asian range
             if signal.direction == "long":
                 sl = ar.asian_low
