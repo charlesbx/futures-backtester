@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import time
 
 import pandas as pd
+from tqdm import tqdm
 
 from .data_loader import INSTRUMENTS, load_processed
 
@@ -679,3 +680,177 @@ def build_param_grid() -> list[dict]:
                         })
 
     return grid
+
+
+# ======================================================================
+# Grid search with precomputation
+# ======================================================================
+
+
+def _precompute_asian_ranges(
+    data: dict[str, pd.DataFrame],
+    asian_end_values: list[time],
+    min_ticks_values: list[float],
+    max_ticks_values: list[float | None],
+) -> dict[tuple[str, str, float, float | None], list[AsianRange]]:
+    """Precompute Asian ranges for all parameter combinations.
+
+    The key optimization: only ``len(asian_end_values) × len(data)``
+    actual range computations are performed (e.g. 3 × 2 = 6), then each
+    result is filtered by (min_ticks, max_ticks) to build the full cache.
+
+    Args:
+        data: Dict mapping instrument name to OHLCV DataFrame
+        asian_end_values: Unique asian_end time values from the grid
+        min_ticks_values: Unique min_range_ticks values from the grid
+        max_ticks_values: Unique max_range_ticks values from the grid
+
+    Returns:
+        Dict keyed by (instrument, asian_end_str, min_ticks, max_ticks)
+        mapping to a list of AsianRange objects that pass the filters
+    """
+    cache: dict[tuple[str, str, float, float | None], list[AsianRange]] = {}
+
+    for instrument, df in data.items():
+        tick_size = INSTRUMENTS[instrument]["tick_size"]
+
+        for asian_end in asian_end_values:
+            ae_str = asian_end.strftime("%H:%M")
+
+            # Compute ALL ranges with no filtering (min=0, max=None)
+            unfiltered_strategy = AsianRangeStrategy(
+                asian_end=asian_end,
+                min_range_ticks=0,
+                max_range_ticks=None,
+            )
+            all_ranges = unfiltered_strategy.find_asian_ranges(
+                df, instrument, tick_size,
+            )
+
+            # Filter by each (min_ticks, max_ticks) combination
+            for mn in min_ticks_values:
+                for mx in max_ticks_values:
+                    filtered = [
+                        r for r in all_ranges
+                        if r.range_ticks >= mn
+                        and (mx is None or r.range_ticks <= mx)
+                    ]
+                    cache[(instrument, ae_str, mn, mx)] = filtered
+
+    return cache
+
+
+def run_grid_search(
+    data: dict[str, pd.DataFrame],
+    param_grid: list[dict],
+    progress: bool = False,
+) -> pd.DataFrame:
+    """Run grid search over parameter combinations with precomputation.
+
+    Precomputes Asian ranges for each unique (instrument, asian_end) pair,
+    then filters by min/max ticks. This avoids redundant range scans —
+    only ``len(asian_end_values) × len(instruments)`` actual computations
+    instead of one per grid combination.
+
+    Args:
+        data: Dict mapping instrument name to OHLCV DataFrame
+        param_grid: List of parameter dicts (from build_param_grid())
+        progress: Whether to show a tqdm progress bar
+
+    Returns:
+        DataFrame with one row per parameter combination and metric columns
+    """
+    from .metrics import calculate_metrics
+
+    # Extract unique parameter values for precomputation
+    asian_end_values = sorted(
+        {p["asian_end"] for p in param_grid},
+        key=lambda t: (t.hour, t.minute),
+    )
+    min_ticks_values = sorted({p["min_range_ticks"] for p in param_grid})
+    max_ticks_values = sorted(
+        {p["max_range_ticks"] for p in param_grid},
+        key=lambda x: (0, x) if x is not None else (1, 0),
+    )
+
+    print(
+        f"  Precomputing Asian ranges for "
+        f"{len(asian_end_values)} asian_end values "
+        f"× {len(data)} instruments..."
+    )
+    range_cache = _precompute_asian_ranges(
+        data, asian_end_values, min_ticks_values, max_ticks_values,
+    )
+
+    # Precompute day groups for fast trade simulation
+    print("  Precomputing day groups...")
+    day_groups: dict[str, dict[pd.Timestamp, pd.DataFrame]] = {}
+    for instrument, df in data.items():
+        day_groups[instrument] = {
+            date: gdf for date, gdf in df.groupby(df.index.normalize())
+        }
+
+    print(f"  Done. Running {len(param_grid)} parameter combinations...")
+
+    results: list[dict] = []
+    iterator = tqdm(param_grid, desc="Grid search") if progress else param_grid
+
+    for params in iterator:
+        strategy = AsianRangeStrategy(**params)
+
+        ae_str = params["asian_end"].strftime("%H:%M")
+        mn = params["min_range_ticks"]
+        mx = params["max_range_ticks"]
+
+        all_trades: list[Trade] = []
+
+        for instrument, df in data.items():
+            tick_size = INSTRUMENTS[instrument]["tick_size"]
+            tick_value = INSTRUMENTS[instrument]["tick_value"]
+
+            # Look up cached ranges
+            ranges = range_cache.get((instrument, ae_str, mn, mx), [])
+            if not ranges:
+                continue
+
+            # Find signals from cached ranges
+            signals = strategy.find_signals(df, ranges)
+
+            # Simulate each signal
+            inst_day_groups = day_groups[instrument]
+            for signal in signals:
+                day_data = inst_day_groups.get(signal.date)
+                if day_data is None:
+                    continue
+                trade = simulate_trade(
+                    signal, day_data, strategy,
+                    tick_size, tick_value,
+                )
+                if trade is not None:
+                    all_trades.append(trade)
+
+        metrics = calculate_metrics(all_trades)
+
+        results.append({
+            "mode": params["mode"],
+            "asian_end": ae_str,
+            "trade_start": params["trade_start"].strftime("%H:%M"),
+            "trade_end": params["trade_end"].strftime("%H:%M"),
+            "min_range_ticks": mn,
+            "max_range_ticks": mx,
+            "stop_type": params["stop_type"],
+            "tp_type": params["tp_type"],
+            "rr_ratio": params["rr_ratio"],
+            "stop_multiple": params["stop_multiple"],
+            "total_trades": metrics.get("total_trades", 0),
+            "win_rate": metrics.get("win_rate", 0),
+            "profit_factor": metrics.get("profit_factor", 0),
+            "total_pnl": metrics.get("total_pnl", 0),
+            "sharpe_ratio": metrics.get("sharpe_ratio", 0),
+            "max_drawdown": metrics.get("max_drawdown", 0),
+            "avg_pnl_per_trade": metrics.get("avg_pnl_per_trade", 0),
+            "pnl_long": metrics.get("pnl_long", 0),
+            "pnl_short": metrics.get("pnl_short", 0),
+        })
+
+    return pd.DataFrame(results)
