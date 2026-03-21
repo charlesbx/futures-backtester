@@ -197,3 +197,157 @@ class AsianRangeStrategy:
             ))
 
         return ranges
+
+    # ------------------------------------------------------------------
+    # Signal detection
+    # ------------------------------------------------------------------
+
+    def find_signals(
+        self,
+        df: pd.DataFrame,
+        ranges: list[AsianRange],
+    ) -> list[AsianSignal]:
+        """Find breakout or fade signals for each Asian range.
+
+        For each range, builds a trade window from ``self.trade_start`` to
+        ``self.trade_end`` on the range's date, then dispatches to the
+        appropriate detector based on ``self.mode``.
+
+        Args:
+            df: OHLCV 1-min DataFrame with Eastern Time DatetimeIndex
+            ranges: List of AsianRange objects (from find_asian_ranges)
+
+        Returns:
+            List of AsianSignal objects (at most one per day)
+        """
+        signals: list[AsianSignal] = []
+        tz = df.index.tz
+
+        for ar in ranges:
+            # Build trade window timestamps on the range's date
+            d = ar.date
+            window_start = pd.Timestamp(
+                year=d.year, month=d.month, day=d.day,
+                hour=self.trade_start.hour, minute=self.trade_start.minute,
+            )
+            window_end = pd.Timestamp(
+                year=d.year, month=d.month, day=d.day,
+                hour=self.trade_end.hour, minute=self.trade_end.minute,
+            )
+            if tz is not None:
+                window_start = window_start.tz_localize(tz)
+                window_end = window_end.tz_localize(tz)
+
+            mask = (df.index >= window_start) & (df.index < window_end)
+            window_bars = df.loc[mask]
+
+            if window_bars.empty:
+                continue
+
+            if self.mode == "breakout":
+                sig = self._find_breakout_signal(window_bars, ar)
+            else:
+                sig = self._find_fade_signal(window_bars, ar)
+
+            if sig is not None:
+                signals.append(sig)
+
+        return signals
+
+    def _find_breakout_signal(
+        self,
+        window_bars: pd.DataFrame,
+        ar: AsianRange,
+    ) -> AsianSignal | None:
+        """Detect the first breakout above/below the Asian range.
+
+        - Long: first bar where high > asian_high — entry at asian_high
+        - Short: first bar where low < asian_low — entry at asian_low
+        - Same-bar tiebreaker: open >= midpoint → long, else short
+          (matches SRS pattern in backtester._detect_breakout)
+
+        Returns:
+            AsianSignal or None if no breakout in the window
+        """
+        highs = window_bars["high"]
+        lows = window_bars["low"]
+
+        long_mask = highs > ar.asian_high
+        short_mask = lows < ar.asian_low
+
+        long_breaks = window_bars.index[long_mask]
+        short_breaks = window_bars.index[short_mask]
+
+        first_long = long_breaks[0] if len(long_breaks) > 0 else None
+        first_short = short_breaks[0] if len(short_breaks) > 0 else None
+
+        # Determine direction and entry
+        if first_long is not None and first_short is not None:
+            if first_long < first_short:
+                direction, entry_time, entry_price = "long", first_long, ar.asian_high
+            elif first_short < first_long:
+                direction, entry_time, entry_price = "short", first_short, ar.asian_low
+            else:
+                # Same bar — use open relative to range midpoint
+                bar = window_bars.loc[first_long]
+                mid = (ar.asian_high + ar.asian_low) / 2
+                if bar["open"] >= mid:
+                    direction, entry_time, entry_price = "long", first_long, ar.asian_high
+                else:
+                    direction, entry_time, entry_price = "short", first_short, ar.asian_low
+        elif first_long is not None:
+            direction, entry_time, entry_price = "long", first_long, ar.asian_high
+        elif first_short is not None:
+            direction, entry_time, entry_price = "short", first_short, ar.asian_low
+        else:
+            return None
+
+        return AsianSignal(
+            date=ar.date,
+            direction=direction,
+            mode="breakout",
+            entry_price=entry_price,
+            entry_time=entry_time,
+            asian_range=ar,
+            instrument=ar.instrument,
+        )
+
+    def _find_fade_signal(
+        self,
+        window_bars: pd.DataFrame,
+        ar: AsianRange,
+    ) -> AsianSignal | None:
+        """Detect the first fade (rejection) off the Asian range boundary.
+
+        - Short fade: bar high touches/exceeds asian_high but close < asian_high
+        - Long fade: bar low touches/goes below asian_low but close > asian_low
+        - Returns on the first rejection found (bar-by-bar walk)
+
+        Returns:
+            AsianSignal or None if no rejection in the window
+        """
+        for ts, bar in window_bars.iterrows():
+            # Short fade: wick above but rejected
+            if bar["high"] >= ar.asian_high and bar["close"] < ar.asian_high:
+                return AsianSignal(
+                    date=ar.date,
+                    direction="short",
+                    mode="fade",
+                    entry_price=bar["close"],
+                    entry_time=ts,
+                    asian_range=ar,
+                    instrument=ar.instrument,
+                )
+            # Long fade: wick below but rejected
+            if bar["low"] <= ar.asian_low and bar["close"] > ar.asian_low:
+                return AsianSignal(
+                    date=ar.date,
+                    direction="long",
+                    mode="fade",
+                    entry_price=bar["close"],
+                    entry_time=ts,
+                    asian_range=ar,
+                    instrument=ar.instrument,
+                )
+
+        return None

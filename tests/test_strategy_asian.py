@@ -348,6 +348,148 @@ class TestFindAsianRanges:
 
 
 # ---------------------------------------------------------------------------
+# Signal detection — Breakout
+# ---------------------------------------------------------------------------
+
+
+class TestBreakoutSignals:
+    """Tests for AsianRangeStrategy._find_breakout_signal() via find_signals()."""
+
+    @staticmethod
+    def _make_range() -> AsianRange:
+        """Build a standard AsianRange for 2024-01-08."""
+        return AsianRange(
+            date=pd.Timestamp("2024-01-08"),
+            asian_high=5010.0,
+            asian_low=4990.0,
+            asian_start=pd.Timestamp("2024-01-07 18:00", tz=TZ),
+            asian_end=pd.Timestamp("2024-01-08 02:00", tz=TZ),
+            range_ticks=round((5010.0 - 4990.0) / TICK_SIZE_MES),
+            instrument="MES",
+        )
+
+    def test_long_breakout(self):
+        """High exceeds asian_high -> long signal with entry_price = asian_high."""
+        df = make_overnight_bars(
+            "2024-01-08",
+            asian_high=5010.0,
+            asian_low=4990.0,
+            us_high=5020.0,  # breaks above asian_high
+            us_low=4995.0,   # stays above asian_low
+        )
+        strategy = AsianRangeStrategy(mode="breakout", min_range_ticks=1)
+        ar = self._make_range()
+        signals = strategy.find_signals(df, [ar])
+
+        assert len(signals) == 1
+        sig = signals[0]
+        assert sig.direction == "long"
+        assert sig.mode == "breakout"
+        assert sig.entry_price == 5010.0
+
+    def test_short_breakout(self):
+        """Low breaks below asian_low -> short signal with entry_price = asian_low."""
+        df = make_overnight_bars(
+            "2024-01-08",
+            asian_high=5010.0,
+            asian_low=4990.0,
+            us_high=5005.0,  # stays below asian_high
+            us_low=4980.0,   # breaks below asian_low
+        )
+        strategy = AsianRangeStrategy(mode="breakout", min_range_ticks=1)
+        ar = self._make_range()
+        signals = strategy.find_signals(df, [ar])
+
+        assert len(signals) == 1
+        sig = signals[0]
+        assert sig.direction == "short"
+        assert sig.mode == "breakout"
+        assert sig.entry_price == 4990.0
+
+    def test_no_breakout(self):
+        """Price stays inside range -> no signal."""
+        df = make_overnight_bars(
+            "2024-01-08",
+            asian_high=5010.0,
+            asian_low=4990.0,
+            us_high=5005.0,  # inside range
+            us_low=4995.0,   # inside range
+        )
+        strategy = AsianRangeStrategy(mode="breakout", min_range_ticks=1)
+        ar = self._make_range()
+        signals = strategy.find_signals(df, [ar])
+
+        assert len(signals) == 0
+
+
+# ---------------------------------------------------------------------------
+# Signal detection — Fade
+# ---------------------------------------------------------------------------
+
+
+class TestFadeSignals:
+    """Tests for AsianRangeStrategy._find_fade_signal() via find_signals()."""
+
+    @staticmethod
+    def _make_range() -> AsianRange:
+        """Build a standard AsianRange for 2024-01-08."""
+        return AsianRange(
+            date=pd.Timestamp("2024-01-08"),
+            asian_high=5010.0,
+            asian_low=4990.0,
+            asian_start=pd.Timestamp("2024-01-07 18:00", tz=TZ),
+            asian_end=pd.Timestamp("2024-01-08 02:00", tz=TZ),
+            range_ticks=round((5010.0 - 4990.0) / TICK_SIZE_MES),
+            instrument="MES",
+        )
+
+    def test_fade_high_short(self):
+        """High touches boundary but close below -> short fade signal at bar close."""
+        # Build bars where a bar's high >= asian_high but close < asian_high
+        df = make_overnight_bars(
+            "2024-01-08",
+            asian_high=5010.0,
+            asian_low=4990.0,
+            us_high=5010.0,  # exactly touches asian_high
+            us_low=4995.0,   # stays above asian_low
+        )
+        # The spike bar in make_overnight_bars has high=us_high and close=us_mid.
+        # us_mid = (5010 + 4995)/2 = 5002.5, which is < 5010 (asian_high).
+        # So high >= asian_high AND close < asian_high => short fade.
+        strategy = AsianRangeStrategy(mode="fade", min_range_ticks=1)
+        ar = self._make_range()
+        signals = strategy.find_signals(df, [ar])
+
+        assert len(signals) == 1
+        sig = signals[0]
+        assert sig.direction == "short"
+        assert sig.mode == "fade"
+        # Entry price should be the bar's close
+        assert sig.entry_price == 5002.5
+
+    def test_no_fade_when_close_above(self):
+        """High touches boundary and close stays above -> no fade (it's a breakout)."""
+        # Build bars where the high exceeds asian_high AND close >= asian_high
+        df = make_overnight_bars(
+            "2024-01-08",
+            asian_high=5010.0,
+            asian_low=4990.0,
+            us_high=5030.0,  # well above
+            us_low=5011.0,   # all bars stay above asian_high
+        )
+        # us_mid = (5030 + 5011)/2 = 5020.5, close=5020.5 which is > 5010
+        # The default bars have high=us_mid+1=5021.5 and low=us_mid-1=5019.5
+        # The spike bar has high=5030 but close=5020.5 which is > asian_high (5010)
+        # So high >= asian_high but close >= asian_high => NOT a short fade
+        # Low never touches asian_low (all lows >= 5019.5 > 4990) => no long fade either
+        strategy = AsianRangeStrategy(mode="fade", min_range_ticks=1)
+        ar = self._make_range()
+        signals = strategy.find_signals(df, [ar])
+
+        assert len(signals) == 0
+
+
+# ---------------------------------------------------------------------------
 # Module constants
 # ---------------------------------------------------------------------------
 
