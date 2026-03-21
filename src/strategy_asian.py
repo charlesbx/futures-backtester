@@ -230,9 +230,15 @@ class AsianRangeStrategy:
             )
 
             # Localize to match the DataFrame timezone
+            # Use nonexistent='shift_forward' for DST spring-forward gaps
+            # (e.g. 2:00 AM doesn't exist on spring-forward dates)
             if tz is not None:
-                window_start = window_start.tz_localize(tz)
-                window_end = window_end.tz_localize(tz)
+                window_start = window_start.tz_localize(
+                    tz, nonexistent="shift_forward",
+                )
+                window_end = window_end.tz_localize(
+                    tz, nonexistent="shift_forward",
+                )
 
             # Filter bars within the Asian window
             mask = (df.index >= window_start) & (df.index < window_end)
@@ -306,8 +312,12 @@ class AsianRangeStrategy:
                 hour=self.trade_end.hour, minute=self.trade_end.minute,
             )
             if tz is not None:
-                window_start = window_start.tz_localize(tz)
-                window_end = window_end.tz_localize(tz)
+                window_start = window_start.tz_localize(
+                    tz, nonexistent="shift_forward",
+                )
+                window_end = window_end.tz_localize(
+                    tz, nonexistent="shift_forward",
+                )
 
             mask = (df.index >= window_start) & (df.index < window_end)
             window_bars = df.loc[mask]
@@ -466,7 +476,9 @@ def simulate_trade(
         hour=trade_end_t.hour, minute=trade_end_t.minute,
     )
     if tz is not None:
-        trade_end_ts = trade_end_ts.tz_localize(tz)
+        trade_end_ts = trade_end_ts.tz_localize(
+            tz, nonexistent="shift_forward",
+        )
 
     # Filter bars from entry_time to trade_end
     mask = (day_data.index >= entry_t) & (day_data.index < trade_end_ts)
@@ -590,8 +602,13 @@ def run_backtest(
         }
 
         # Simulate each signal
+        tz = df.index.tz
         for signal in signals:
-            day_data = day_groups.get(signal.date)
+            # signal.date is tz-naive; day_groups keys are tz-aware
+            lookup_date = signal.date
+            if tz is not None and lookup_date.tz is None:
+                lookup_date = lookup_date.tz_localize(tz)
+            day_data = day_groups.get(lookup_date)
             if day_data is None:
                 continue
             trade = simulate_trade(
@@ -819,8 +836,13 @@ def run_grid_search(
 
             # Simulate each signal
             inst_day_groups = day_groups[instrument]
+            inst_tz = df.index.tz
             for signal in signals:
-                day_data = inst_day_groups.get(signal.date)
+                # signal.date is tz-naive; day_groups keys are tz-aware
+                lookup_date = signal.date
+                if inst_tz is not None and lookup_date.tz is None:
+                    lookup_date = lookup_date.tz_localize(inst_tz)
+                day_data = inst_day_groups.get(lookup_date)
                 if day_data is None:
                     continue
                 trade = simulate_trade(
