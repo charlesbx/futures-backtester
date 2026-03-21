@@ -983,3 +983,162 @@ def run_walk_forward(
             })
 
     return pd.DataFrame(wf_results)
+
+
+# ======================================================================
+# Report generation
+# ======================================================================
+
+
+def generate_report(
+    grid_results: pd.DataFrame | None,
+    wf_results: pd.DataFrame | None,
+    baseline: dict | None,
+) -> str:
+    """Generate comprehensive text report from saved results.
+
+    Args:
+        grid_results: DataFrame from run_grid_search() with columns:
+            mode, asian_end, trade_start, trade_end, min_range_ticks,
+            max_range_ticks, stop_type, tp_type, rr_ratio, stop_multiple,
+            total_trades, win_rate, profit_factor, total_pnl, sharpe_ratio,
+            max_drawdown, avg_pnl_per_trade, pnl_long, pnl_short
+        wf_results: DataFrame from run_walk_forward() with columns:
+            window_id, train_start, train_end, test_start, test_end,
+            params, is_pnl, oos_pnl, is_sharpe, oos_sharpe, is_pf, oos_pf
+        baseline: Dict with keys: total_trades, win_rate, profit_factor,
+            total_pnl, sharpe_ratio, max_drawdown, avg_pnl_per_trade
+
+    Returns:
+        Formatted text report string
+    """
+    lines: list[str] = []
+    lines.append("=" * 70)
+    lines.append("  ASIAN RANGE BREAKOUT / FADE STRATEGY — REPORT")
+    lines.append("=" * 70)
+
+    # ------------------------------------------------------------------
+    # Section 1: Baseline
+    # ------------------------------------------------------------------
+    if baseline:
+        lines.append("\n--- BASELINE (Default Parameters) ---")
+        for key in [
+            "total_trades", "win_rate", "profit_factor", "total_pnl",
+            "sharpe_ratio", "max_drawdown", "avg_pnl_per_trade",
+        ]:
+            val = baseline.get(key)
+            if val is None:
+                continue
+            if isinstance(val, float):
+                lines.append(f"  {key:<25} {val:>15.4f}")
+            else:
+                lines.append(f"  {key:<25} {val:>15}")
+
+    # ------------------------------------------------------------------
+    # Sections 2-5: Grid search
+    # ------------------------------------------------------------------
+    if grid_results is not None and not grid_results.empty:
+        # Section 2: Grid Search Summary
+        total_combos = len(grid_results)
+        profitable = grid_results[grid_results["profit_factor"] > 1.0]
+        pct_profitable = len(profitable) / total_combos if total_combos else 0
+
+        lines.append(f"\n--- GRID SEARCH ({total_combos} combinations) ---")
+        lines.append(
+            f"  Profitable (PF > 1.0): {len(profitable)} "
+            f"({pct_profitable:.1%})"
+        )
+        lines.append(f"  Mean PF: {grid_results['profit_factor'].mean():.3f}")
+        lines.append(f"  Max PF: {grid_results['profit_factor'].max():.3f}")
+        lines.append(f"  Mean PnL: ${grid_results['total_pnl'].mean():,.0f}")
+
+        # Section 3: Top 10 by Total PnL
+        lines.append("\n  Top 10 by Total PnL:")
+        top = grid_results.nlargest(10, "total_pnl")
+        header = (
+            f"  {'mode':>9} {'asian_end':>9} {'trade_start':>11} "
+            f"{'trade_end':>9} {'stop':>6} {'tp':>8} "
+            f"{'trades':>6} {'WR':>6} {'PF':>6} {'PnL':>10}"
+        )
+        lines.append(header)
+        lines.append("  " + "-" * 86)
+        for _, r in top.iterrows():
+            lines.append(
+                f"  {r['mode']:>9} {r['asian_end']:>9} "
+                f"{r['trade_start']:>11} {r['trade_end']:>9} "
+                f"{r['stop_type']:>6} {r['tp_type']:>8} "
+                f"{r['total_trades']:>6.0f} {r['win_rate']:>5.1%} "
+                f"{r['profit_factor']:>6.3f} ${r['total_pnl']:>9,.0f}"
+            )
+
+        # Section 4: Parameter Sensitivity
+        lines.append("\n  Parameter Sensitivity (mean PF & mean PnL):")
+        sensitivity_params = [
+            "mode", "asian_end", "trade_start", "trade_end",
+            "min_range_ticks", "max_range_ticks", "stop_type", "tp_type",
+        ]
+        for param in sensitivity_params:
+            lines.append(f"\n  By {param}:")
+            grouped = grid_results.groupby(param, dropna=False).agg(
+                mean_pf=("profit_factor", "mean"),
+                mean_pnl=("total_pnl", "mean"),
+            )
+            for val, row in grouped.iterrows():
+                val_str = str(val) if pd.notna(val) else "None"
+                lines.append(
+                    f"    {val_str:<15} PF={row['mean_pf']:.3f}  "
+                    f"PnL=${row['mean_pnl']:>8,.0f}"
+                )
+
+        # Section 5: Mode Comparison — Breakout vs Fade
+        lines.append("\n--- MODE COMPARISON — Breakout vs Fade ---")
+        for mode_val in ["breakout", "fade"]:
+            subset = grid_results[grid_results["mode"] == mode_val]
+            if subset.empty:
+                continue
+            mode_profitable = subset[subset["profit_factor"] > 1.0]
+            pct = len(mode_profitable) / len(subset) if len(subset) else 0
+            lines.append(f"\n  {mode_val.upper()}:")
+            lines.append(f"    Total combos:  {len(subset)}")
+            lines.append(f"    Profitable:    {len(mode_profitable)} ({pct:.1%})")
+            lines.append(f"    Mean PF:       {subset['profit_factor'].mean():.3f}")
+            lines.append(f"    Best PnL:      ${subset['total_pnl'].max():,.0f}")
+
+        # Section 7: Instrument Analysis (Top 5 by PnL)
+        if "pnl_long" in grid_results.columns and "pnl_short" in grid_results.columns:
+            lines.append("\n--- INSTRUMENT ANALYSIS (Top 5 by PnL) ---")
+            top5 = grid_results.nlargest(5, "total_pnl")
+            header_inst = (
+                f"  {'mode':>9} {'PnL_Long':>12} {'PnL_Short':>12}"
+            )
+            lines.append(header_inst)
+            lines.append("  " + "-" * 35)
+            for _, r in top5.iterrows():
+                lines.append(
+                    f"  {r['mode']:>9} ${r['pnl_long']:>11,.0f} "
+                    f"${r['pnl_short']:>11,.0f}"
+                )
+
+    # ------------------------------------------------------------------
+    # Section 6: Walk-Forward OOS
+    # ------------------------------------------------------------------
+    if wf_results is not None and not wf_results.empty:
+        lines.append(
+            f"\n--- WALK-FORWARD ({wf_results['window_id'].nunique()} windows) ---"
+        )
+        lines.append(f"  Total OOS PnL: ${wf_results['oos_pnl'].sum():,.0f}")
+        lines.append(f"  Mean OOS PF: {wf_results['oos_pf'].mean():.3f}")
+        lines.append(f"  Mean IS PF: {wf_results['is_pf'].mean():.3f}")
+        oos_positive = (wf_results["oos_pnl"] > 0).sum()
+        total_wf = len(wf_results)
+        lines.append(
+            f"  OOS positive: {oos_positive}/{total_wf} "
+            f"({oos_positive / total_wf:.1%})"
+        )
+        is_mean = wf_results["is_pf"].mean()
+        oos_mean = wf_results["oos_pf"].mean()
+        degradation = 1 - oos_mean / max(is_mean, 1e-9)
+        lines.append(f"  IS→OOS degradation: {degradation:.1%}")
+
+    lines.append("\n" + "=" * 70)
+    return "\n".join(lines)
