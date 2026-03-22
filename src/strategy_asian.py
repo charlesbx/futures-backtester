@@ -814,6 +814,39 @@ def run_grid_search(
             date: gdf for date, gdf in df.groupby(df.index.normalize())
         }
 
+    # --- Precompute signals for each unique base combo ---
+    # Signals depend only on (mode, asian_end, trade_start, trade_end, min_range, max_range)
+    # There are only 324 unique base combos vs 4,050 total combos.
+    base_keys = set()
+    for p in param_grid:
+        ae_str = p["asian_end"].strftime("%H:%M")
+        ts_str = p["trade_start"].strftime("%H:%M")
+        te_str = p["trade_end"].strftime("%H:%M")
+        base_keys.add((p["mode"], ae_str, ts_str, te_str,
+                        p["min_range_ticks"], p["max_range_ticks"]))
+
+    print(f"  Precomputing signals for {len(base_keys)} base combos "
+          f"× {len(data)} instruments...")
+    # signal_cache: (instrument, mode, ae, ts, te, mn, mx) -> list[AsianSignal]
+    signal_cache: dict[tuple, list] = {}
+    for instrument, df in data.items():
+        inst_tz = df.index.tz
+        for mode, ae_str, ts_str, te_str, mn, mx in base_keys:
+            h, m = map(int, ae_str.split(":"))
+            h2, m2 = map(int, ts_str.split(":"))
+            h3, m3 = map(int, te_str.split(":"))
+            strategy_for_signals = AsianRangeStrategy(
+                mode=mode, asian_end=time(h, m),
+                trade_start=time(h2, m2), trade_end=time(h3, m3),
+                min_range_ticks=mn, max_range_ticks=mx,
+            )
+            ranges = range_cache.get((instrument, ae_str, mn, mx), [])
+            if not ranges:
+                signal_cache[(instrument, mode, ae_str, ts_str, te_str, mn, mx)] = []
+                continue
+            signals = strategy_for_signals.find_signals(df, ranges)
+            signal_cache[(instrument, mode, ae_str, ts_str, te_str, mn, mx)] = signals
+
     print(f"  Done. Running {len(param_grid)} parameter combinations...")
 
     results: list[dict] = []
@@ -823,6 +856,8 @@ def run_grid_search(
         strategy = AsianRangeStrategy(**params)
 
         ae_str = params["asian_end"].strftime("%H:%M")
+        ts_str = params["trade_start"].strftime("%H:%M")
+        te_str = params["trade_end"].strftime("%H:%M")
         mn = params["min_range_ticks"]
         mx = params["max_range_ticks"]
 
@@ -832,19 +867,17 @@ def run_grid_search(
             tick_size = INSTRUMENTS[instrument]["tick_size"]
             tick_value = INSTRUMENTS[instrument]["tick_value"]
 
-            # Look up cached ranges
-            ranges = range_cache.get((instrument, ae_str, mn, mx), [])
-            if not ranges:
+            # Look up cached signals
+            signals = signal_cache.get(
+                (instrument, params["mode"], ae_str, ts_str, te_str, mn, mx), []
+            )
+            if not signals:
                 continue
 
-            # Find signals from cached ranges
-            signals = strategy.find_signals(df, ranges)
-
-            # Simulate each signal
+            # Simulate each signal (only exit params vary)
             inst_day_groups = day_groups[instrument]
             inst_tz = df.index.tz
             for signal in signals:
-                # signal.date is tz-naive; day_groups keys are tz-aware
                 lookup_date = signal.date
                 if inst_tz is not None and lookup_date.tz is None:
                     lookup_date = lookup_date.tz_localize(inst_tz)
