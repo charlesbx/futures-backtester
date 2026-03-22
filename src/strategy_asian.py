@@ -230,15 +230,18 @@ class AsianRangeStrategy:
             )
 
             # Localize to match the DataFrame timezone
-            # Use nonexistent='shift_forward' for DST spring-forward gaps
-            # (e.g. 2:00 AM doesn't exist on spring-forward dates)
+            # nonexistent='shift_forward': 2:00 AM doesn't exist on spring-forward
+            # ambiguous=True: pick first occurrence on fall-back (1 AM occurs twice)
             if tz is not None:
-                window_start = window_start.tz_localize(
-                    tz, nonexistent="shift_forward",
-                )
-                window_end = window_end.tz_localize(
-                    tz, nonexistent="shift_forward",
-                )
+                try:
+                    window_start = window_start.tz_localize(
+                        tz, nonexistent="shift_forward", ambiguous=True,
+                    )
+                    window_end = window_end.tz_localize(
+                        tz, nonexistent="shift_forward", ambiguous=True,
+                    )
+                except Exception:
+                    continue  # skip dates with unresolvable DST issues
 
             # Filter bars within the Asian window
             mask = (df.index >= window_start) & (df.index < window_end)
@@ -312,12 +315,15 @@ class AsianRangeStrategy:
                 hour=self.trade_end.hour, minute=self.trade_end.minute,
             )
             if tz is not None:
-                window_start = window_start.tz_localize(
-                    tz, nonexistent="shift_forward",
-                )
-                window_end = window_end.tz_localize(
-                    tz, nonexistent="shift_forward",
-                )
+                try:
+                    window_start = window_start.tz_localize(
+                        tz, nonexistent="shift_forward", ambiguous=True,
+                    )
+                    window_end = window_end.tz_localize(
+                        tz, nonexistent="shift_forward", ambiguous=True,
+                    )
+                except Exception:
+                    continue
 
             mask = (df.index >= window_start) & (df.index < window_end)
             window_bars = df.loc[mask]
@@ -477,7 +483,7 @@ def simulate_trade(
     )
     if tz is not None:
         trade_end_ts = trade_end_ts.tz_localize(
-            tz, nonexistent="shift_forward",
+            tz, nonexistent="shift_forward", ambiguous=True,
         )
 
     # Filter bars from entry_time to trade_end
