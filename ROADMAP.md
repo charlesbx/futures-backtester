@@ -28,11 +28,22 @@
 - [x] **Key finding: 9:15 AM gap measurement (pre-market) >> 9:30 AM (regular open).** Overnight session close captures a stronger signal than the cash open.
 - [x] **Conclusion: closest to viable but still not tradeable.** High win rate (67%), gaps do fill, but per-trade edge (~$2) is eaten by transaction costs.
 
+### Strategy 4: Asian Range (Breakout + Fade)
+- [x] Baseline (breakout, midnight, opposite stop, RR=2.0): **PF=1.80, +$157,123, Sharpe=3.86, 3,486 trades**
+- [x] Grid search (4,050 combos): **57.5% profitable**, mean PF=1.365, max PF=2.914, best PnL=$182k
+- [x] **Breakout mode dominant**: 80% profitable (mean PF=1.65) vs fade 24% (mean PF=0.94)
+- [x] **Best combo**: breakout, midnight, 9:30→2PM, opposite stop, RR=3.0 → PF=2.06, Sharpe=4.48
+- [x] Walk-forward (9 windows): **OOS PF=2.985**, 100% positive (90/90), IS→OOS degradation only 5.6%
+- [x] **Conclusion: TRADEABLE.** First strategy to survive OOS validation. Breakout of overnight Asian range (6PM-midnight ET) has a robust, persistent edge on MES/MNQ. Edge weakening in recent windows (2025 PF=1.20) but still profitable. Fade mode does not work (PF=0.94).
+
 ## Learnings
 
 1. **Simple single-factor intraday strategies on liquid index futures are picked clean.** SRS breakouts, intraday momentum, and gap fades are all well-known — the edge is priced in.
 2. **Exit management matters more than entry.** SRS improved dramatically by disabling range reentry. Gap Fade's high win rate was offset by uncapped losers.
-3. **The backtester infrastructure is production-ready.** Three strategies designed, implemented, optimized, and walk-forward validated. The framework handles everything from data loading to multi-parameter optimization.
+3. **The backtester infrastructure is production-ready.** Four strategies designed, implemented, optimized, and walk-forward validated.
+4. **Overnight range breakout is structurally different from intraday patterns.** The Asian range (6PM-midnight) captures institutional positioning during low-liquidity hours. The breakout during US hours exploits this information asymmetry — unlike SRS (same-session range) which competes against full market participation.
+5. **Higher R:R ratios (3:1) outperform lower ones on range breakouts.** The best combos use RR=3.0 with ~50% win rate, earning 3x on winners vs 1x on losers. This contrasts with Gap Fade where high win rate + low R:R failed.
+6. **Edge decay is real.** Asian range OOS PF declined from 6.1 (2022) to 1.2 (2025) — the strategy is becoming more crowded. Monitor ongoing performance closely.
 
 ## Next Steps (Potential)
 
