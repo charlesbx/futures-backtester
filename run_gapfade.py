@@ -13,7 +13,7 @@ from pathlib import Path
 
 from src.data_loader import load_processed
 from src.metrics import calculate_metrics
-from src.strategy_gapfade import (
+from src.strategies.gapfade import (
     GapFadeStrategy,
     build_param_grid,
     generate_report,

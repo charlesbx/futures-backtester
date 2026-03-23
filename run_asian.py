@@ -13,7 +13,7 @@ from pathlib import Path
 
 from src.data_loader import load_processed
 from src.metrics import calculate_metrics
-from src.strategy_asian import (
+from src.strategies.asian_range import (
     AsianRangeStrategy,
     build_param_grid,
     generate_report,

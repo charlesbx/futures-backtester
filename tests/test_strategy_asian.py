@@ -5,7 +5,7 @@ from datetime import time
 import pandas as pd
 import pytest
 
-from src.strategy_asian import (
+from src.strategies.asian_range import (
     ASIAN_START,
     MIN_RANGE_BARS,
     AsianRange,

@@ -21,9 +21,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 
-from src.backtester import Backtester, Trade
+from src.backtester import run_backtest
 from src.data_loader import INSTRUMENTS, load_processed
-from src.strategy import SRSStrategy
+from src.strategies.srs import SRSStrategy
+from src.trade import Trade
 
 PROJECT_ROOT = Path(__file__).parent.parent
 
@@ -62,12 +63,8 @@ def load_data() -> dict[str, pd.DataFrame]:
 
 def run_config(data: dict[str, pd.DataFrame], config: dict) -> list[Trade]:
     """Run backtester with a given config across both instruments."""
-    strategy = SRSStrategy(**config["strategy"])
-    backtester = Backtester(slippage_ticks=1, commission=1.24, **config["backtester"])
-    trades = []
-    for instrument in ["MES", "MNQ"]:
-        trades.extend(backtester.run(data[instrument], strategy, instrument))
-    return trades
+    strategy = SRSStrategy(**config["strategy"], **config.get("backtester", {}))
+    return run_backtest(strategy, data, slippage_ticks=1, commission=1.24)
 
 
 def trades_to_dataframe(trades: list[Trade], config_name: str) -> pd.DataFrame:

@@ -1,4 +1,4 @@
-"""Overnight Gap Fade Strategy.
+"""Overnight Gap Fade Strategy — BaseStrategy implementation.
 
 Gaps between the previous session close and the current session open
 tend to fill. Fade the gap (buy gap-downs, sell gap-ups), targeting
@@ -17,7 +17,13 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-from .data_loader import INSTRUMENTS, load_processed
+from ..data_loader import INSTRUMENTS
+from ..trade import BaseStrategy
+from ..trade import Trade as BaseTrade
+from . import register
+
+# Re-export for backward compatibility (callers may import Trade from this module)
+Trade = BaseTrade
 
 
 @dataclass
@@ -33,29 +39,9 @@ class GapSignal:
     instrument: str
 
 
-@dataclass
-class Trade:
-    """An executed trade, compatible with metrics.calculate_metrics()."""
-
-    entry_time: pd.Timestamp
-    exit_time: pd.Timestamp
-    direction: str
-    entry_price: float
-    exit_price: float
-    stop_loss: float
-    take_profit: float
-    pnl_ticks: float
-    pnl_dollars: float
-    exit_reason: str        # 'tp', 'sl', 'session_end'
-    session: int            # always 0 for gap fade
-    instrument: str
-    date: pd.Timestamp
-    range_high: float       # unused, set to 0.0
-    range_low: float        # unused, set to 0.0
-
-
-class GapFadeStrategy:
-    """Overnight Gap Fade strategy.
+@register
+class GapFadeStrategy(BaseStrategy):
+    """Overnight Gap Fade strategy implementing BaseStrategy.
 
     Args:
         gap_measure_time: Time at which to measure the gap (default 9:30 AM ET)
@@ -63,6 +49,8 @@ class GapFadeStrategy:
         fill_pct: Target fill fraction: 0.75 means target 75% of the way back to prev_close
         stop_gap_multiple: If set, stop = entry +/- stop_gap_multiple * abs(gap_size)
     """
+
+    name = "gapfade"
 
     def __init__(
         self,
@@ -75,6 +63,133 @@ class GapFadeStrategy:
         self.min_gap_pct = min_gap_pct
         self.fill_pct = fill_pct
         self.stop_gap_multiple = stop_gap_multiple
+
+    # ------------------------------------------------------------------
+    # BaseStrategy interface
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def default_params(cls) -> dict:
+        return {
+            "gap_measure_time": "09:30",
+            "min_gap_pct": 0.001,
+            "fill_pct": 0.75,
+            "stop_gap_multiple": None,
+        }
+
+    @classmethod
+    def from_params(cls, params: dict) -> "GapFadeStrategy":
+        """Construct from a parameter dict.
+
+        Accepts gap_measure_time as either a datetime.time object or
+        an "HH:MM" string. Accepts stop_gap_multiple as None, NaN, or float.
+        """
+        raw_time = params["gap_measure_time"]
+        if isinstance(raw_time, str):
+            h, m = map(int, raw_time.split(":"))
+            measure_t = time(h, m)
+        else:
+            measure_t = raw_time
+
+        raw_stop = params.get("stop_gap_multiple")
+        if raw_stop is None or (isinstance(raw_stop, float) and np.isnan(raw_stop)):
+            stop_mult = None
+        else:
+            stop_mult = float(raw_stop)
+
+        return cls(
+            gap_measure_time=measure_t,
+            min_gap_pct=float(params["min_gap_pct"]),
+            fill_pct=float(params["fill_pct"]),
+            stop_gap_multiple=stop_mult,
+        )
+
+    def to_params(self) -> dict:
+        return {
+            "gap_measure_time": self.gap_measure_time.strftime("%H:%M"),
+            "min_gap_pct": self.min_gap_pct,
+            "fill_pct": self.fill_pct,
+            "stop_gap_multiple": self.stop_gap_multiple,
+        }
+
+    @classmethod
+    def build_param_grid(cls) -> list[dict]:
+        """Generate 180 parameter combinations.
+
+        gap_measure_time: [9:15, 9:30, 9:31]                     (3)
+        min_gap_pct:      [0.0005, 0.001, 0.0015, 0.0025, 0.005] (5)
+        fill_pct:         [0.50, 0.75, 1.00]                      (3)
+        stop_gap_multiple:[None, 0.25, 0.50, 1.00]                (4)
+        Total: 3 × 5 × 3 × 4 = 180
+        """
+        measure_times = ["09:15", "09:30", "09:31"]
+        min_gaps = [0.0005, 0.001, 0.0015, 0.0025, 0.005]
+        fill_pcts = [0.50, 0.75, 1.00]
+        stop_multiples = [None, 0.25, 0.50, 1.00]
+
+        grid = []
+        for mt, mg, fp, sm in itertools.product(measure_times, min_gaps, fill_pcts, stop_multiples):
+            grid.append({
+                "gap_measure_time": mt,
+                "min_gap_pct": mg,
+                "fill_pct": fp,
+                "stop_gap_multiple": sm,
+            })
+        return grid
+
+    def generate_signals(self, data: dict[str, pd.DataFrame]) -> list[GapSignal]:
+        """Generate gap fade signals for all instruments.
+
+        Args:
+            data: Dict mapping instrument name to OHLCV 1-min DataFrame
+                  with Eastern Time DatetimeIndex.
+
+        Returns:
+            Combined list of GapSignal objects across all instruments.
+        """
+        all_signals = []
+        for instrument, df in data.items():
+            all_signals.extend(self.find_signals(df, instrument))
+        return all_signals
+
+    def simulate_trade(
+        self,
+        signal: GapSignal,
+        df: pd.DataFrame,
+        slippage_ticks: float,
+        commission: float,
+    ) -> BaseTrade | None:
+        """Simulate a single gap fade trade from the full instrument DataFrame.
+
+        Slices the relevant day from df using signal.date, then delegates
+        to the module-level _simulate_trade() function.
+
+        Args:
+            signal: GapSignal produced by generate_signals().
+            df: Full OHLCV 1-min DataFrame for signal.instrument.
+            slippage_ticks: Slippage in ticks per trade.
+            commission: Round-trip commission in dollars.
+
+        Returns:
+            A Trade object, or None if entry bar not found.
+        """
+        instrument = signal.instrument
+        tick_size = INSTRUMENTS[instrument]["tick_size"]
+        tick_value = INSTRUMENTS[instrument]["tick_value"]
+
+        date_col = df.index.normalize()
+        day_data = df.loc[date_col == signal.date]
+        if day_data.empty:
+            return None
+
+        return _simulate_trade(
+            signal, day_data, self, tick_size, tick_value,
+            slippage_ticks, commission,
+        )
+
+    # ------------------------------------------------------------------
+    # Signal detection (kept on class for direct use)
+    # ------------------------------------------------------------------
 
     def find_signals(self, df: pd.DataFrame, instrument: str) -> list[GapSignal]:
         """Find daily gap fade signals.
@@ -145,8 +260,148 @@ class GapFadeStrategy:
 
         return signals
 
+    # ------------------------------------------------------------------
+    # Optimized grid search override
+    # ------------------------------------------------------------------
 
-def simulate_trade(
+    @classmethod
+    def run_grid_search(
+        cls,
+        data: dict[str, pd.DataFrame],
+        param_grid: list[dict] | None = None,
+        slippage_ticks: float = 1,
+        commission: float = 1.24,
+        progress: bool = True,
+    ) -> pd.DataFrame:
+        """Run grid search with precomputed gap data for performance.
+
+        Precomputes gap data for each (instrument, gap_measure_time) to avoid
+        redundant signal scanning. Only 6 precomputations needed for 180 combos.
+        """
+        from ..metrics import calculate_metrics
+
+        if param_grid is None:
+            param_grid = cls.build_param_grid()
+
+        # Normalise time values to time objects for precomputation
+        def _to_time(v) -> time:
+            if isinstance(v, str):
+                h, m = map(int, v.split(":"))
+                return time(h, m)
+            return v
+
+        # Extract unique gap_measure_time values (as time objects)
+        measure_time_values = sorted(
+            set(_to_time(p["gap_measure_time"]) for p in param_grid),
+            key=lambda t: (t.hour, t.minute),
+        )
+        print(f"  Precomputing gap data for {len(measure_time_values)} measure_time values × {len(data)} instruments...")
+        gap_cache = _precompute_gap_data(data, measure_time_values)
+
+        # Precompute day groups for fast trade simulation
+        print(f"  Precomputing day groups...")
+        day_groups = {}
+        for instrument, df in data.items():
+            day_groups[instrument] = {date: gdf for date, gdf in df.groupby(df.index.normalize())}
+
+        # Precompute timezone per instrument
+        tz_map = {instrument: df.index.tz for instrument, df in data.items()}
+
+        print(f"  Done. Running {len(param_grid)} parameter combinations...")
+
+        results = []
+        iterator = tqdm(param_grid, desc="Grid search") if progress else param_grid
+
+        for params in iterator:
+            measure_t = _to_time(params["gap_measure_time"])
+            measure_t_str = measure_t.strftime("%H:%M")
+            min_gap = params["min_gap_pct"]
+            fill_pct = params["fill_pct"]
+            raw_stop = params.get("stop_gap_multiple")
+            stop_mult = None if (raw_stop is None or (isinstance(raw_stop, float) and np.isnan(raw_stop))) else float(raw_stop)
+
+            strategy = cls(
+                gap_measure_time=measure_t,
+                min_gap_pct=min_gap,
+                fill_pct=fill_pct,
+                stop_gap_multiple=stop_mult,
+            )
+
+            all_trades = []
+            for instrument, df in data.items():
+                tz = tz_map[instrument]
+                tick_size = INSTRUMENTS[instrument]["tick_size"]
+                tick_value = INSTRUMENTS[instrument]["tick_value"]
+                gaps_df = gap_cache.get((instrument, measure_t_str))
+                if gaps_df is None or gaps_df.empty:
+                    continue
+
+                for _, row in gaps_df.iterrows():
+                    gp = row["gap_pct"]
+                    if abs(gp) <= min_gap:
+                        continue
+
+                    date = row["date"]
+                    direction = "long" if gp < 0 else "short"
+
+                    date_naive = pd.Timestamp(date.date()) if hasattr(date, 'date') else pd.Timestamp(date)
+                    entry_ts = date_naive + pd.Timedelta(hours=measure_t.hour, minutes=measure_t.minute)
+                    if tz is not None:
+                        entry_ts = entry_ts.tz_localize(tz)
+
+                    signal = GapSignal(
+                        date=date,
+                        direction=direction,
+                        gap_pct=gp,
+                        prev_close=row["prev_close"],
+                        measure_price=row["measure_price"],
+                        entry_time=entry_ts,
+                        instrument=instrument,
+                    )
+
+                    dd = day_groups[instrument].get(date)
+                    if dd is None:
+                        continue
+                    trade = _simulate_trade(signal, dd, strategy, tick_size, tick_value, slippage_ticks, commission)
+                    if trade is not None:
+                        all_trades.append(trade)
+
+            metrics = calculate_metrics(all_trades)
+
+            results.append({
+                "gap_measure_time": measure_t_str,
+                "min_gap_pct": min_gap,
+                "fill_pct": fill_pct,
+                "stop_gap_multiple": stop_mult,
+                "total_trades": metrics.get("total_trades", 0),
+                "win_rate": metrics.get("win_rate", 0),
+                "profit_factor": metrics.get("profit_factor", 0),
+                "total_pnl": metrics.get("total_pnl", 0),
+                "sharpe_ratio": metrics.get("sharpe_ratio", 0),
+                "max_drawdown": metrics.get("max_drawdown", 0),
+                "avg_pnl_per_trade": metrics.get("avg_pnl_per_trade", 0),
+                "pnl_long": metrics.get("pnl_long", 0),
+                "pnl_short": metrics.get("pnl_short", 0),
+            })
+
+        return pd.DataFrame(results)
+
+    @classmethod
+    def generate_report(
+        cls,
+        grid_results: pd.DataFrame | None,
+        wf_results: pd.DataFrame | None,
+        baseline: dict | None,
+    ) -> str:
+        """Generate comprehensive text report from saved results."""
+        return generate_report(grid_results, wf_results, baseline)
+
+
+# ---------------------------------------------------------------------------
+# Module-level functions — backward compatibility
+# ---------------------------------------------------------------------------
+
+def _simulate_trade(
     signal: GapSignal,
     day_data: pd.DataFrame,
     strategy: GapFadeStrategy,
@@ -154,8 +409,8 @@ def simulate_trade(
     tick_value: float,
     slippage_ticks: float = 1,
     commission: float = 1.24,
-) -> Trade | None:
-    """Simulate a single gap fade trade bar-by-bar.
+) -> BaseTrade | None:
+    """Simulate a single gap fade trade bar-by-bar (internal implementation).
 
     Args:
         signal: GapSignal with direction, prev_close, measure_price, entry_time
@@ -245,7 +500,7 @@ def simulate_trade(
 
     pnl_dollars = pnl_ticks * tick_value - commission
 
-    return Trade(
+    return BaseTrade(
         entry_time=trade_bars.iloc[0].name,
         exit_time=exit_time,
         direction=signal.direction,
@@ -264,12 +519,41 @@ def simulate_trade(
     )
 
 
+def simulate_trade(
+    signal: GapSignal,
+    day_data: pd.DataFrame,
+    strategy: GapFadeStrategy,
+    tick_size: float,
+    tick_value: float,
+    slippage_ticks: float = 1,
+    commission: float = 1.24,
+) -> BaseTrade | None:
+    """Simulate a single gap fade trade bar-by-bar.
+
+    Args:
+        signal: GapSignal with direction, prev_close, measure_price, entry_time
+        day_data: Pre-sliced day OHLCV DataFrame (Eastern Time)
+        strategy: GapFadeStrategy instance (for fill_pct and stop_gap_multiple)
+        tick_size: Instrument tick size
+        tick_value: Instrument tick value per tick
+        slippage_ticks: Slippage in ticks per side
+        commission: Round-trip commission in dollars
+
+    Returns:
+        Trade object or None if entry bar not found
+    """
+    return _simulate_trade(
+        signal, day_data, strategy, tick_size, tick_value,
+        slippage_ticks, commission,
+    )
+
+
 def run_backtest(
     data: dict[str, pd.DataFrame],
     strategy: GapFadeStrategy,
     slippage_ticks: float = 1,
     commission: float = 1.24,
-) -> list[Trade]:
+) -> list[BaseTrade]:
     """Run backtest across all instruments.
 
     Args:
@@ -293,7 +577,7 @@ def run_backtest(
             day_data = day_groups.get(signal.date)
             if day_data is None:
                 continue
-            trade = simulate_trade(
+            trade = _simulate_trade(
                 signal, day_data, strategy, tick_size, tick_value,
                 slippage_ticks, commission
             )
@@ -303,28 +587,19 @@ def run_backtest(
 
 
 def build_param_grid() -> list[dict]:
-    """Generate 180 parameter combinations.
+    """Generate 180 parameter combinations. Delegates to GapFadeStrategy.build_param_grid()."""
+    return GapFadeStrategy.build_param_grid()
 
-    gap_measure_time: [9:15, 9:30, 9:31]                     (3)
-    min_gap_pct:      [0.0005, 0.001, 0.0015, 0.0025, 0.005] (5)
-    fill_pct:         [0.50, 0.75, 1.00]                      (3)
-    stop_gap_multiple:[None, 0.25, 0.50, 1.00]                (4)
-    Total: 3 × 5 × 3 × 4 = 180
-    """
-    measure_times = [time(9, 15), time(9, 30), time(9, 31)]
-    min_gaps = [0.0005, 0.001, 0.0015, 0.0025, 0.005]
-    fill_pcts = [0.50, 0.75, 1.00]
-    stop_multiples = [None, 0.25, 0.50, 1.00]
 
-    grid = []
-    for mt, mg, fp, sm in itertools.product(measure_times, min_gaps, fill_pcts, stop_multiples):
-        grid.append({
-            "gap_measure_time": mt,
-            "min_gap_pct": mg,
-            "fill_pct": fp,
-            "stop_gap_multiple": sm,
-        })
-    return grid
+def run_grid_search(
+    data: dict[str, pd.DataFrame],
+    param_grid: list[dict],
+    progress: bool = False,
+) -> pd.DataFrame:
+    """Run grid search (backward-compatible standalone function)."""
+    return GapFadeStrategy.run_grid_search(
+        data, param_grid, progress=progress,
+    )
 
 
 def _precompute_gap_data(
@@ -385,132 +660,6 @@ def _precompute_gap_data(
     return cache
 
 
-def run_grid_search(
-    data: dict[str, pd.DataFrame],
-    param_grid: list[dict],
-    progress: bool = False,
-) -> pd.DataFrame:
-    """Run grid search over parameter combinations.
-
-    Precomputes gap data for each (instrument, gap_measure_time) to avoid
-    redundant signal scanning. Only 6 precomputations for 180 combos.
-    """
-    from .metrics import calculate_metrics
-
-    # Extract unique gap_measure_time values for precomputation
-    measure_time_values = sorted(
-        set(p["gap_measure_time"] for p in param_grid),
-        key=lambda t: (t.hour, t.minute),
-    )
-    print(f"  Precomputing gap data for {len(measure_time_values)} measure_time values × {len(data)} instruments...")
-    gap_cache = _precompute_gap_data(data, measure_time_values)
-
-    # Precompute day groups for fast trade simulation
-    print(f"  Precomputing day groups...")
-    day_groups = {}
-    for instrument, df in data.items():
-        day_groups[instrument] = {date: gdf for date, gdf in df.groupby(df.index.normalize())}
-
-    # Precompute timezone per instrument
-    tz_map = {instrument: df.index.tz for instrument, df in data.items()}
-
-    print(f"  Done. Running {len(param_grid)} parameter combinations...")
-
-    results = []
-    iterator = tqdm(param_grid, desc="Grid search") if progress else param_grid
-
-    for params in iterator:
-        measure_t = params["gap_measure_time"]
-        measure_t_str = measure_t.strftime("%H:%M")
-        min_gap = params["min_gap_pct"]
-        fill_pct = params["fill_pct"]
-        stop_mult = params["stop_gap_multiple"]
-
-        strategy = GapFadeStrategy(
-            gap_measure_time=measure_t,
-            min_gap_pct=min_gap,
-            fill_pct=fill_pct,
-            stop_gap_multiple=stop_mult,
-        )
-
-        all_trades = []
-        for instrument, df in data.items():
-            tz = tz_map[instrument]
-            tick_size = INSTRUMENTS[instrument]["tick_size"]
-            tick_value = INSTRUMENTS[instrument]["tick_value"]
-            gaps_df = gap_cache.get((instrument, measure_t_str))
-            if gaps_df is None or gaps_df.empty:
-                continue
-
-            for _, row in gaps_df.iterrows():
-                gp = row["gap_pct"]
-                if abs(gp) <= min_gap:
-                    continue
-
-                date = row["date"]
-                direction = "long" if gp < 0 else "short"
-
-                date_naive = pd.Timestamp(date.date()) if hasattr(date, 'date') else pd.Timestamp(date)
-                entry_ts = date_naive + pd.Timedelta(hours=measure_t.hour, minutes=measure_t.minute)
-                if tz is not None:
-                    entry_ts = entry_ts.tz_localize(tz)
-
-                signal = GapSignal(
-                    date=date,
-                    direction=direction,
-                    gap_pct=gp,
-                    prev_close=row["prev_close"],
-                    measure_price=row["measure_price"],
-                    entry_time=entry_ts,
-                    instrument=instrument,
-                )
-
-                dd = day_groups[instrument].get(date)
-                if dd is None:
-                    continue
-                trade = simulate_trade(signal, dd, strategy, tick_size, tick_value)
-                if trade is not None:
-                    all_trades.append(trade)
-
-        metrics = calculate_metrics(all_trades)
-
-        results.append({
-            "gap_measure_time": measure_t_str,
-            "min_gap_pct": min_gap,
-            "fill_pct": fill_pct,
-            "stop_gap_multiple": stop_mult,
-            "total_trades": metrics.get("total_trades", 0),
-            "win_rate": metrics.get("win_rate", 0),
-            "profit_factor": metrics.get("profit_factor", 0),
-            "total_pnl": metrics.get("total_pnl", 0),
-            "sharpe_ratio": metrics.get("sharpe_ratio", 0),
-            "max_drawdown": metrics.get("max_drawdown", 0),
-            "avg_pnl_per_trade": metrics.get("avg_pnl_per_trade", 0),
-            "pnl_long": metrics.get("pnl_long", 0),
-            "pnl_short": metrics.get("pnl_short", 0),
-        })
-
-    return pd.DataFrame(results)
-
-
-def _run_single_config(
-    data: dict[str, pd.DataFrame],
-    params: dict,
-) -> tuple[dict, list[Trade]]:
-    """Run a single parameter configuration and return metrics + trades."""
-    from .metrics import calculate_metrics
-
-    strategy = GapFadeStrategy(
-        gap_measure_time=params["gap_measure_time"],
-        min_gap_pct=params["min_gap_pct"],
-        fill_pct=params["fill_pct"],
-        stop_gap_multiple=params["stop_gap_multiple"],
-    )
-    trades = run_backtest(data, strategy)
-    metrics = calculate_metrics(trades)
-    return metrics, trades
-
-
 def _filter_data_by_date(
     data: dict[str, pd.DataFrame],
     start: pd.Timestamp,
@@ -521,6 +670,19 @@ def _filter_data_by_date(
         inst: df[(df.index >= start) & (df.index < end)]
         for inst, df in data.items()
     }
+
+
+def _run_single_config(
+    data: dict[str, pd.DataFrame],
+    params: dict,
+) -> tuple[dict, list[BaseTrade]]:
+    """Run a single parameter configuration and return metrics + trades."""
+    from ..metrics import calculate_metrics
+
+    strategy = GapFadeStrategy.from_params(params)
+    trades = run_backtest(data, strategy)
+    metrics = calculate_metrics(trades)
+    return metrics, trades
 
 
 def run_walk_forward(
@@ -567,8 +729,8 @@ def run_walk_forward(
         train_data = _filter_data_by_date(data, train_start, train_end)
         test_data = _filter_data_by_date(data, test_start, test_end)
 
-        # In-sample grid search
-        is_results = run_grid_search(train_data, param_grid)
+        # In-sample grid search (uses optimized class method)
+        is_results = GapFadeStrategy.run_grid_search(train_data, param_grid, progress=False)
         if is_results.empty:
             continue
 

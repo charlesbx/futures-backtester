@@ -45,6 +45,17 @@
 5. **Higher R:R ratios (3:1) outperform lower ones on range breakouts.** The best combos use RR=3.0 with ~50% win rate, earning 3x on winners vs 1x on losers. This contrasts with Gap Fade where high win rate + low R:R failed.
 6. **Edge decay is real.** Asian range OOS PF declined from 6.1 (2022) to 1.2 (2025) — the strategy is becoming more crowded. Monitor ongoing performance closely.
 
+### Engine Refactor: Strategy-Agnostic Architecture
+- [x] `BaseStrategy` ABC with plugin interface (`generate_signals`, `simulate_trade`, `build_param_grid`, etc.)
+- [x] Auto-discovery registry: strategies in `src/strategies/` are auto-registered
+- [x] Generic backtest engine (`src/backtester.py`): runs any BaseStrategy on OHLCV data
+- [x] Generic optimizer (`src/optimizer.py`): grid search + walk-forward for any strategy
+- [x] All 4 strategies migrated to BaseStrategy interface (SRS, Asian Range, IntMom, GapFade)
+- [x] Per-strategy optimized `run_grid_search` with precomputation preserved
+- [x] Unified CLI: `python run.py <strategy> [--optimize|--walk-forward|--report]`
+- [x] Zero test regression (33/33 tests pass)
+- [x] Old monolithic strategy files removed; all imports updated
+
 ## Next Steps (Potential)
 
 ### Multi-Factor Combinations

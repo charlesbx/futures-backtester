@@ -1,4 +1,6 @@
-"""Asian Range Breakout / Fade Strategy.
+"""Asian Range Breakout / Fade Strategy — BaseStrategy implementation.
+
+Migrated from src/strategy_asian.py to the new BaseStrategy interface.
 
 The Asian session (6:00 PM to ~2:00 AM ET) establishes a range that
 US-session traders react to. Two modes:
@@ -7,8 +9,8 @@ US-session traders react to. Two modes:
   Asian range during US hours.
 - **fade**: fade the breakout, expecting price to return inside the range.
 
-Provides Asian range detection, signal generation, trade simulation,
-grid search, walk-forward analysis, and report generation.
+Backward-compatible module-level functions are preserved so existing
+callers (tests, scripts) continue to work without modification.
 """
 
 import itertools
@@ -19,13 +21,24 @@ from datetime import time
 import pandas as pd
 from tqdm import tqdm
 
-from .data_loader import INSTRUMENTS, load_processed
+from ..data_loader import INSTRUMENTS
+from ..trade import BaseStrategy
+from ..trade import Trade as BaseTrade
+from . import register
+
+# Re-export for backward compatibility (tests import Trade from this module)
+Trade = BaseTrade
 
 # Asian session always starts at 6:00 PM ET (previous calendar day)
 ASIAN_START = time(18, 0)
 
 # Minimum number of 1-min bars required to form a valid range
 MIN_RANGE_BARS = 5
+
+
+# ======================================================================
+# Domain dataclasses
+# ======================================================================
 
 
 @dataclass
@@ -54,28 +67,13 @@ class AsianSignal:
     instrument: str
 
 
-@dataclass
-class Trade:
-    """An executed trade, compatible with metrics.calculate_metrics()."""
-
-    entry_time: pd.Timestamp
-    exit_time: pd.Timestamp
-    direction: str
-    entry_price: float
-    exit_price: float
-    stop_loss: float
-    take_profit: float
-    pnl_ticks: float
-    pnl_dollars: float
-    exit_reason: str        # 'tp', 'sl', 'session_end'
-    session: int            # always 0 for Asian range strategy
-    instrument: str
-    date: pd.Timestamp
-    range_high: float
-    range_low: float
+# ======================================================================
+# Strategy class
+# ======================================================================
 
 
-class AsianRangeStrategy:
+@register
+class AsianRangeStrategy(BaseStrategy):
     """Asian Range Breakout / Fade strategy.
 
     Args:
@@ -85,11 +83,13 @@ class AsianRangeStrategy:
         trade_end: Latest time; force-exit at this time (default 4:00 PM ET)
         min_range_ticks: Minimum range size in ticks to consider (default 10)
         max_range_ticks: Maximum range size in ticks (default None = no limit)
-        stop_type: 'opposite' (opposite side of range, breakout only) or 'multiple' (stop_multiple * range)
+        stop_type: 'opposite' (opposite side of range, breakout only) or 'multiple'
         tp_type: 'rr' (risk/reward), 'opposite' (measured move / boundary), or 'midpoint'
         rr_ratio: Risk/reward ratio for take-profit (default 2.0)
         stop_multiple: Multiplier for stop distance when stop_type='multiple'
     """
+
+    name = "asian_range"
 
     # Asian session always starts at 6:00 PM ET
     ASIAN_START = time(18, 0)
@@ -119,12 +119,544 @@ class AsianRangeStrategy:
         self.stop_multiple = stop_multiple
 
     # ------------------------------------------------------------------
+    # BaseStrategy: parameter interface
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def default_params(cls) -> dict:
+        """Return default parameter values for the strategy."""
+        return {
+            "mode": "breakout",
+            "asian_end": "02:00",
+            "trade_start": "09:30",
+            "trade_end": "16:00",
+            "min_range_ticks": 10,
+            "max_range_ticks": None,
+            "stop_type": "opposite",
+            "tp_type": "rr",
+            "rr_ratio": 2.0,
+            "stop_multiple": 1.0,
+        }
+
+    @classmethod
+    def from_params(cls, params: dict) -> "AsianRangeStrategy":
+        """Create an instance from a parameter dictionary.
+
+        Handles time params as either ``datetime.time`` objects or
+        ``"HH:MM"`` strings (from DataFrame serialization).
+        """
+        def _parse_time(val) -> time:
+            if isinstance(val, time):
+                return val
+            # "HH:MM" string
+            return time(*map(int, val.split(":")))
+
+        return cls(
+            mode=params["mode"],
+            asian_end=_parse_time(params["asian_end"]),
+            trade_start=_parse_time(params["trade_start"]),
+            trade_end=_parse_time(params["trade_end"]),
+            min_range_ticks=params["min_range_ticks"],
+            max_range_ticks=params["max_range_ticks"],
+            stop_type=params["stop_type"],
+            tp_type=params["tp_type"],
+            rr_ratio=params["rr_ratio"],
+            stop_multiple=params["stop_multiple"],
+        )
+
+    def to_params(self) -> dict:
+        """Serialize current strategy parameters to a dictionary.
+
+        Time fields are serialized as ``"HH:MM"`` strings. ``None`` is
+        preserved for ``max_range_ticks``.
+        """
+        return {
+            "mode": self.mode,
+            "asian_end": self.asian_end.strftime("%H:%M"),
+            "trade_start": self.trade_start.strftime("%H:%M"),
+            "trade_end": self.trade_end.strftime("%H:%M"),
+            "min_range_ticks": self.min_range_ticks,
+            "max_range_ticks": self.max_range_ticks,
+            "stop_type": self.stop_type,
+            "tp_type": self.tp_type,
+            "rr_ratio": self.rr_ratio,
+            "stop_multiple": self.stop_multiple,
+        }
+
+    # ------------------------------------------------------------------
+    # BaseStrategy: signal generation
+    # ------------------------------------------------------------------
+
+    def generate_signals(self, data: dict[str, pd.DataFrame]) -> list[AsianSignal]:
+        """Generate trading signals from OHLCV data.
+
+        For each instrument, finds Asian ranges then detects entry signals.
+
+        Args:
+            data: Dict mapping instrument name to OHLCV 1-min DataFrame
+                  with Eastern Time DatetimeIndex.
+
+        Returns:
+            List of AsianSignal objects.
+        """
+        all_signals: list[AsianSignal] = []
+        for instrument, df in data.items():
+            tick_size = INSTRUMENTS[instrument]["tick_size"]
+            ranges = self.find_asian_ranges(df, instrument, tick_size)
+            signals = self.find_signals(df, ranges)
+            all_signals.extend(signals)
+        return all_signals
+
+    # ------------------------------------------------------------------
+    # BaseStrategy: trade simulation
+    # ------------------------------------------------------------------
+
+    def simulate_trade(
+        self,
+        signal: AsianSignal,
+        df: pd.DataFrame,
+        slippage_ticks: float,
+        commission: float,
+    ) -> BaseTrade | None:
+        """Simulate a single trade from a signal.
+
+        Extracts the relevant day's data from the full instrument DataFrame,
+        then delegates to the standalone ``simulate_trade()`` function.
+
+        Args:
+            signal: AsianSignal produced by generate_signals().
+            df: Full OHLCV 1-min DataFrame for the signal's instrument.
+            slippage_ticks: Slippage in ticks per trade.
+            commission: Round-trip commission in dollars.
+
+        Returns:
+            A Trade object, or None if the trade could not be executed.
+        """
+        instrument = signal.instrument
+        tick_size = INSTRUMENTS[instrument]["tick_size"]
+        tick_value = INSTRUMENTS[instrument]["tick_value"]
+
+        # Extract the day's data
+        tz = df.index.tz
+        lookup_date = signal.date
+        if tz is not None and lookup_date.tz is None:
+            lookup_date = lookup_date.tz_localize(tz)
+
+        day_groups = {
+            date: gdf for date, gdf in df.groupby(df.index.normalize())
+        }
+        day_data = day_groups.get(lookup_date)
+        if day_data is None:
+            return None
+
+        return _simulate_trade(
+            signal, day_data, self,
+            tick_size, tick_value,
+            slippage_ticks, commission,
+        )
+
+    # ------------------------------------------------------------------
+    # BaseStrategy: param grid
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def build_param_grid(cls) -> list[dict]:
+        """Build a grid of all valid parameter combinations.
+
+        Generates exactly 4,050 combinations:
+        - Breakout: 162 base x 15 exit combos = 2,430
+        - Fade: 162 base x 10 exit combos = 1,620
+        - Total: 4,050
+
+        CRITICAL: stop_type='opposite' is excluded when mode='fade'.
+        Fade entries are near the boundary, making opposite-side stops useless.
+
+        Time fields are returned as ``"HH:MM"`` strings (BaseStrategy convention).
+
+        Returns:
+            List of dicts, each with all 10 parameter keys.
+        """
+        modes = ["breakout", "fade"]
+        asian_ends = [time(0, 0), time(1, 0), time(2, 0)]
+        trade_starts = [time(8, 0), time(9, 0), time(9, 30)]
+        trade_ends = [time(12, 0), time(14, 0), time(16, 0)]
+        min_range_ticks_vals = [5, 10, 15]
+        max_range_ticks_vals = [75, None]
+
+        stop_types = ["opposite", "multiple"]
+        tp_types = ["rr", "opposite", "midpoint"]
+        rr_ratios = [1.0, 2.0, 3.0]
+        stop_multiples = [0.5, 1.0]
+
+        grid: list[dict] = []
+
+        base_combos = itertools.product(
+            modes, asian_ends, trade_starts, trade_ends,
+            min_range_ticks_vals, max_range_ticks_vals,
+        )
+
+        for mode, asian_end, trade_start, trade_end, min_rt, max_rt in base_combos:
+            for stop_type in stop_types:
+                # CRITICAL: skip opposite stop for fade mode
+                if mode == "fade" and stop_type == "opposite":
+                    continue
+
+                # Determine stop_multiple values
+                if stop_type == "multiple":
+                    sm_values = stop_multiples
+                else:
+                    # opposite stop: stop_multiple unused, use default
+                    sm_values = [0.5]
+
+                for tp_type in tp_types:
+                    # Determine rr_ratio values
+                    if tp_type == "rr":
+                        rr_values = rr_ratios
+                    else:
+                        # non-rr tp: rr_ratio unused, use default
+                        rr_values = [2.0]
+
+                    for rr_ratio in rr_values:
+                        for stop_multiple in sm_values:
+                            grid.append({
+                                "mode": mode,
+                                "asian_end": asian_end.strftime("%H:%M"),
+                                "trade_start": trade_start.strftime("%H:%M"),
+                                "trade_end": trade_end.strftime("%H:%M"),
+                                "min_range_ticks": min_rt,
+                                "max_range_ticks": max_rt,
+                                "stop_type": stop_type,
+                                "tp_type": tp_type,
+                                "rr_ratio": rr_ratio,
+                                "stop_multiple": stop_multiple,
+                            })
+
+        return grid
+
+    # ------------------------------------------------------------------
+    # BaseStrategy: optimized grid search override
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def run_grid_search(
+        cls,
+        data: dict[str, pd.DataFrame],
+        param_grid: list[dict] | None = None,
+        slippage_ticks: float = 1,
+        commission: float = 1.24,
+        progress: bool = True,
+    ) -> pd.DataFrame:
+        """Run grid search with precomputed ranges and signals.
+
+        Precomputes Asian ranges for each unique (instrument, asian_end) pair,
+        then filters by min/max ticks, and precomputes signals for each unique
+        base combination. This reduces actual range computations from one per
+        grid combination to ``len(asian_end_values) × len(instruments)``.
+
+        Args:
+            data: Dict mapping instrument name to OHLCV DataFrame.
+            param_grid: List of parameter dicts. Defaults to build_param_grid().
+            slippage_ticks: Slippage in ticks per side (default 1).
+            commission: Round-trip commission in dollars (default 1.24).
+            progress: Whether to show a tqdm progress bar.
+
+        Returns:
+            DataFrame with one row per parameter combination and metric columns.
+        """
+        from ..metrics import calculate_metrics
+
+        if param_grid is None:
+            param_grid = cls.build_param_grid()
+
+        # Extract unique parameter values for precomputation
+        # Grid stores times as "HH:MM" strings
+        asian_end_values = sorted(
+            {p["asian_end"] for p in param_grid},
+        )
+        min_ticks_values = sorted({p["min_range_ticks"] for p in param_grid})
+        max_ticks_values = sorted(
+            {p["max_range_ticks"] for p in param_grid},
+            key=lambda x: (0, x) if x is not None else (1, 0),
+        )
+
+        print(
+            f"  Precomputing Asian ranges for "
+            f"{len(asian_end_values)} asian_end values "
+            f"x {len(data)} instruments..."
+        )
+
+        # Precompute ranges
+        # cache key: (instrument, ae_str, min_ticks, max_ticks)
+        range_cache: dict[tuple, list[AsianRange]] = {}
+        for instrument, df in data.items():
+            tick_size = INSTRUMENTS[instrument]["tick_size"]
+            for ae_str in asian_end_values:
+                ae_time = time(*map(int, ae_str.split(":")))
+                # Compute ALL ranges with no filtering
+                unfiltered = cls(
+                    asian_end=ae_time,
+                    min_range_ticks=0,
+                    max_range_ticks=None,
+                )
+                all_ranges = unfiltered.find_asian_ranges(df, instrument, tick_size)
+                # Filter by each (min_ticks, max_ticks) combination
+                for mn in min_ticks_values:
+                    for mx in max_ticks_values:
+                        filtered = [
+                            r for r in all_ranges
+                            if r.range_ticks >= mn
+                            and (mx is None or r.range_ticks <= mx)
+                        ]
+                        range_cache[(instrument, ae_str, mn, mx)] = filtered
+
+        # Precompute day groups for fast trade simulation
+        print("  Precomputing day groups...")
+        day_groups: dict[str, dict[pd.Timestamp, pd.DataFrame]] = {}
+        for instrument, df in data.items():
+            day_groups[instrument] = {
+                date: gdf for date, gdf in df.groupby(df.index.normalize())
+            }
+
+        # Precompute signals for each unique base combo
+        # Signals depend only on (mode, asian_end, trade_start, trade_end, min_range, max_range)
+        base_keys: set[tuple] = set()
+        for p in param_grid:
+            ae_str = p["asian_end"]
+            ts_str = p["trade_start"]
+            te_str = p["trade_end"]
+            base_keys.add((
+                p["mode"], ae_str, ts_str, te_str,
+                p["min_range_ticks"], p["max_range_ticks"],
+            ))
+
+        print(
+            f"  Precomputing signals for {len(base_keys)} base combos "
+            f"x {len(data)} instruments..."
+        )
+        # signal_cache: (instrument, mode, ae, ts, te, mn, mx) -> list[AsianSignal]
+        signal_cache: dict[tuple, list[AsianSignal]] = {}
+        for instrument, df in data.items():
+            for mode, ae_str, ts_str, te_str, mn, mx in base_keys:
+                strategy_for_signals = cls(
+                    mode=mode,
+                    asian_end=time(*map(int, ae_str.split(":"))),
+                    trade_start=time(*map(int, ts_str.split(":"))),
+                    trade_end=time(*map(int, te_str.split(":"))),
+                    min_range_ticks=mn,
+                    max_range_ticks=mx,
+                )
+                ranges = range_cache.get((instrument, ae_str, mn, mx), [])
+                if not ranges:
+                    signal_cache[(instrument, mode, ae_str, ts_str, te_str, mn, mx)] = []
+                    continue
+                signals = strategy_for_signals.find_signals(df, ranges)
+                signal_cache[(instrument, mode, ae_str, ts_str, te_str, mn, mx)] = signals
+
+        print(f"  Done. Running {len(param_grid)} parameter combinations...")
+
+        results: list[dict] = []
+        iterator = tqdm(param_grid, desc="Grid search") if progress else param_grid
+
+        for params in iterator:
+            strategy = cls.from_params(params)
+
+            ae_str = params["asian_end"]
+            ts_str = params["trade_start"]
+            te_str = params["trade_end"]
+            mn = params["min_range_ticks"]
+            mx = params["max_range_ticks"]
+
+            all_trades: list[BaseTrade] = []
+
+            for instrument, df in data.items():
+                tick_size = INSTRUMENTS[instrument]["tick_size"]
+                tick_value = INSTRUMENTS[instrument]["tick_value"]
+
+                signals = signal_cache.get(
+                    (instrument, params["mode"], ae_str, ts_str, te_str, mn, mx), []
+                )
+                if not signals:
+                    continue
+
+                inst_day_groups = day_groups[instrument]
+                inst_tz = df.index.tz
+                for signal in signals:
+                    lookup_date = signal.date
+                    if inst_tz is not None and lookup_date.tz is None:
+                        lookup_date = lookup_date.tz_localize(inst_tz)
+                    day_data = inst_day_groups.get(lookup_date)
+                    if day_data is None:
+                        continue
+                    trade = _simulate_trade(
+                        signal, day_data, strategy,
+                        tick_size, tick_value,
+                        slippage_ticks, commission,
+                    )
+                    if trade is not None:
+                        all_trades.append(trade)
+
+            metrics = calculate_metrics(all_trades)
+
+            results.append({
+                "mode": params["mode"],
+                "asian_end": ae_str,
+                "trade_start": ts_str,
+                "trade_end": te_str,
+                "min_range_ticks": mn,
+                "max_range_ticks": mx,
+                "stop_type": params["stop_type"],
+                "tp_type": params["tp_type"],
+                "rr_ratio": params["rr_ratio"],
+                "stop_multiple": params["stop_multiple"],
+                "total_trades": metrics.get("total_trades", 0),
+                "win_rate": metrics.get("win_rate", 0),
+                "profit_factor": metrics.get("profit_factor", 0),
+                "total_pnl": metrics.get("total_pnl", 0),
+                "sharpe_ratio": metrics.get("sharpe_ratio", 0),
+                "max_drawdown": metrics.get("max_drawdown", 0),
+                "avg_pnl_per_trade": metrics.get("avg_pnl_per_trade", 0),
+                "pnl_long": metrics.get("pnl_long", 0),
+                "pnl_short": metrics.get("pnl_short", 0),
+            })
+
+        return pd.DataFrame(results)
+
+    # ------------------------------------------------------------------
+    # BaseStrategy: walk-forward override
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def run_walk_forward(
+        cls,
+        data: dict[str, pd.DataFrame],
+        param_grid: list[dict] | None = None,
+        train_months: int = 24,
+        test_months: int = 6,
+        top_n: int = 10,
+        slippage_ticks: float = 1,
+        commission: float = 1.24,
+    ) -> pd.DataFrame:
+        """Rolling walk-forward analysis.
+
+        For each window:
+        1. Train: run grid search, select top_n by profit_factor (min 20 trades)
+        2. Test: evaluate top_n out-of-sample
+        3. Record IS and OOS metrics
+        """
+        from ..metrics import calculate_metrics
+
+        if param_grid is None:
+            param_grid = cls.build_param_grid()
+
+        tz = next(iter(data.values())).index.tz
+        global_start = max(df.index.min().date() for df in data.values())
+        global_end = min(df.index.max().date() for df in data.values())
+
+        # Build rolling windows
+        windows = []
+        current = global_start
+        while True:
+            train_start = pd.Timestamp(current, tz=tz)
+            train_end = train_start + pd.DateOffset(months=train_months)
+            test_start = train_end
+            test_end = test_start + pd.DateOffset(months=test_months)
+
+            if test_end.date() > global_end:
+                break
+
+            windows.append((train_start, train_end, test_start, test_end))
+            # Step by test_months — non-overlapping test windows, overlapping train windows
+            current = (train_start + pd.DateOffset(months=test_months)).date()
+
+        print(f"  {len(windows)} walk-forward windows")
+        wf_results = []
+
+        for wid, (train_start, train_end, test_start, test_end) in enumerate(windows):
+            print(
+                f"\n  Window {wid}: train {train_start.date()}→{train_end.date()}, "
+                f"test {test_start.date()}→{test_end.date()}"
+            )
+
+            train_data = _filter_data_by_date(data, train_start, train_end)
+            test_data = _filter_data_by_date(data, test_start, test_end)
+
+            # In-sample grid search (no progress bar)
+            is_results = cls.run_grid_search(
+                train_data, param_grid,
+                slippage_ticks=slippage_ticks,
+                commission=commission,
+                progress=False,
+            )
+            if is_results.empty:
+                continue
+
+            # Filter: minimum 20 trades
+            qualified = is_results[is_results["total_trades"] >= 20]
+            if qualified.empty:
+                continue
+
+            # Select top N by profit factor
+            top_params = qualified.nlargest(top_n, "profit_factor")
+
+            # Evaluate OOS
+            for _, row in top_params.iterrows():
+                max_rt = None if pd.isna(row["max_range_ticks"]) else int(row["max_range_ticks"])
+
+                params = {
+                    "mode": row["mode"],
+                    "asian_end": row["asian_end"],
+                    "trade_start": row["trade_start"],
+                    "trade_end": row["trade_end"],
+                    "min_range_ticks": int(row["min_range_ticks"]),
+                    "max_range_ticks": max_rt,
+                    "stop_type": row["stop_type"],
+                    "tp_type": row["tp_type"],
+                    "rr_ratio": float(row["rr_ratio"]),
+                    "stop_multiple": float(row["stop_multiple"]),
+                }
+
+                strategy = cls.from_params(params)
+                oos_trades = run_backtest(test_data, strategy, slippage_ticks, commission)
+                oos_metrics = calculate_metrics(oos_trades)
+
+                wf_results.append({
+                    "window_id": wid,
+                    "train_start": train_start.date(),
+                    "train_end": train_end.date(),
+                    "test_start": test_start.date(),
+                    "test_end": test_end.date(),
+                    "params": json.dumps({k: str(v) for k, v in params.items()}),
+                    "is_pnl": row["total_pnl"],
+                    "oos_pnl": oos_metrics.get("total_pnl", 0),
+                    "is_sharpe": row["sharpe_ratio"],
+                    "oos_sharpe": oos_metrics.get("sharpe_ratio", 0),
+                    "is_pf": row["profit_factor"],
+                    "oos_pf": oos_metrics.get("profit_factor", 0),
+                })
+
+        return pd.DataFrame(wf_results)
+
+    # ------------------------------------------------------------------
+    # BaseStrategy: report override
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def generate_report(
+        cls,
+        grid_results: pd.DataFrame | None,
+        wf_results: pd.DataFrame | None,
+        baseline: dict | None,
+    ) -> str:
+        """Generate comprehensive text report from optimization results."""
+        return generate_report(grid_results, wf_results, baseline)
+
+    # ------------------------------------------------------------------
     # SL / TP computation
     # ------------------------------------------------------------------
 
     def compute_sl_tp(
         self,
-        signal: "AsianSignal",
+        signal: AsianSignal,
         entry_price: float,
     ) -> tuple[float, float]:
         """Compute stop-loss and take-profit for a signal.
@@ -441,11 +973,11 @@ class AsianRangeStrategy:
 
 
 # ======================================================================
-# Trade simulation
+# Trade simulation (standalone, for backward compat with tests)
 # ======================================================================
 
 
-def simulate_trade(
+def _simulate_trade(
     signal: AsianSignal,
     day_data: pd.DataFrame,
     strategy: AsianRangeStrategy,
@@ -453,8 +985,8 @@ def simulate_trade(
     tick_value: float,
     slippage_ticks: float = 1,
     commission: float = 1.24,
-) -> Trade | None:
-    """Simulate a single Asian range trade bar-by-bar.
+) -> BaseTrade | None:
+    """Simulate a single Asian range trade bar-by-bar (internal implementation).
 
     Args:
         signal: AsianSignal with direction, mode, entry_price, entry_time
@@ -549,7 +1081,7 @@ def simulate_trade(
 
     pnl_dollars = pnl_ticks * tick_value - commission
 
-    return Trade(
+    return BaseTrade(
         entry_time=trade_bars.iloc[0].name,
         exit_time=exit_time,
         direction=signal.direction,
@@ -568,8 +1100,40 @@ def simulate_trade(
     )
 
 
+def simulate_trade(
+    signal: AsianSignal,
+    day_data: pd.DataFrame,
+    strategy: AsianRangeStrategy,
+    tick_size: float,
+    tick_value: float,
+    slippage_ticks: float = 1,
+    commission: float = 1.24,
+) -> BaseTrade | None:
+    """Simulate a single Asian range trade bar-by-bar.
+
+    Backward-compatible wrapper around ``_simulate_trade()``.
+
+    Args:
+        signal: AsianSignal with direction, mode, entry_price, entry_time
+        day_data: Pre-sliced day OHLCV DataFrame (Eastern Time)
+        strategy: AsianRangeStrategy instance (for SL/TP params and trade_end)
+        tick_size: Instrument tick size (e.g. 0.25)
+        tick_value: Instrument tick value per tick (e.g. 1.25 for MES)
+        slippage_ticks: Slippage in ticks per side (default 1)
+        commission: Round-trip commission in dollars (default 1.24)
+
+    Returns:
+        Trade object or None if no bars in the trade window
+    """
+    return _simulate_trade(
+        signal, day_data, strategy,
+        tick_size, tick_value,
+        slippage_ticks, commission,
+    )
+
+
 # ======================================================================
-# Backtest runner
+# Backtest runner (standalone, for backward compat)
 # ======================================================================
 
 
@@ -578,7 +1142,7 @@ def run_backtest(
     strategy: AsianRangeStrategy,
     slippage_ticks: float = 1,
     commission: float = 1.24,
-) -> list[Trade]:
+) -> list[BaseTrade]:
     """Run the Asian Range strategy across multiple instruments.
 
     Args:
@@ -590,7 +1154,7 @@ def run_backtest(
     Returns:
         List of all Trade objects across all instruments
     """
-    all_trades: list[Trade] = []
+    all_trades: list[BaseTrade] = []
 
     for instrument, df in data.items():
         tick_size = INSTRUMENTS[instrument]["tick_size"]
@@ -617,7 +1181,7 @@ def run_backtest(
             day_data = day_groups.get(lookup_date)
             if day_data is None:
                 continue
-            trade = simulate_trade(
+            trade = _simulate_trade(
                 signal, day_data, strategy,
                 tick_size, tick_value,
                 slippage_ticks, commission,
@@ -629,297 +1193,24 @@ def run_backtest(
 
 
 # ======================================================================
-# Parameter grid
+# Parameter grid (standalone, for backward compat)
 # ======================================================================
 
 
 def build_param_grid() -> list[dict]:
     """Build a grid of all valid parameter combinations.
 
-    Generates exactly 4,050 combinations:
-    - Breakout: 162 base x 15 exit combos = 2,430
-    - Fade: 162 base x 10 exit combos = 1,620
-    - Total: 4,050
-
-    CRITICAL: stop_type='opposite' is excluded when mode='fade'.
-    Fade entries are near the boundary, making opposite-side stops useless.
+    Standalone backward-compatible wrapper. Delegates to
+    ``AsianRangeStrategy.build_param_grid()``.
 
     Returns:
-        List of dicts, each with all 10 parameter keys
+        List of dicts, each with all 10 parameter keys.
     """
-    modes = ["breakout", "fade"]
-    asian_ends = [time(0, 0), time(1, 0), time(2, 0)]
-    trade_starts = [time(8, 0), time(9, 0), time(9, 30)]
-    trade_ends = [time(12, 0), time(14, 0), time(16, 0)]
-    min_range_ticks_vals = [5, 10, 15]
-    max_range_ticks_vals = [75, None]
-
-    stop_types = ["opposite", "multiple"]
-    tp_types = ["rr", "opposite", "midpoint"]
-    rr_ratios = [1.0, 2.0, 3.0]
-    stop_multiples = [0.5, 1.0]
-
-    grid: list[dict] = []
-
-    base_combos = itertools.product(
-        modes, asian_ends, trade_starts, trade_ends,
-        min_range_ticks_vals, max_range_ticks_vals,
-    )
-
-    for mode, asian_end, trade_start, trade_end, min_rt, max_rt in base_combos:
-        # Build exit parameter combos
-        for stop_type in stop_types:
-            # CRITICAL: skip opposite stop for fade mode
-            if mode == "fade" and stop_type == "opposite":
-                continue
-
-            # Determine stop_multiple values
-            if stop_type == "multiple":
-                sm_values = stop_multiples
-            else:
-                # opposite stop: stop_multiple unused, use default
-                sm_values = [0.5]
-
-            for tp_type in tp_types:
-                # Determine rr_ratio values
-                if tp_type == "rr":
-                    rr_values = rr_ratios
-                else:
-                    # non-rr tp: rr_ratio unused, use default
-                    rr_values = [2.0]
-
-                for rr_ratio in rr_values:
-                    for stop_multiple in sm_values:
-                        grid.append({
-                            "mode": mode,
-                            "asian_end": asian_end,
-                            "trade_start": trade_start,
-                            "trade_end": trade_end,
-                            "min_range_ticks": min_rt,
-                            "max_range_ticks": max_rt,
-                            "stop_type": stop_type,
-                            "tp_type": tp_type,
-                            "rr_ratio": rr_ratio,
-                            "stop_multiple": stop_multiple,
-                        })
-
-    return grid
+    return AsianRangeStrategy.build_param_grid()
 
 
 # ======================================================================
-# Grid search with precomputation
-# ======================================================================
-
-
-def _precompute_asian_ranges(
-    data: dict[str, pd.DataFrame],
-    asian_end_values: list[time],
-    min_ticks_values: list[float],
-    max_ticks_values: list[float | None],
-) -> dict[tuple[str, str, float, float | None], list[AsianRange]]:
-    """Precompute Asian ranges for all parameter combinations.
-
-    The key optimization: only ``len(asian_end_values) × len(data)``
-    actual range computations are performed (e.g. 3 × 2 = 6), then each
-    result is filtered by (min_ticks, max_ticks) to build the full cache.
-
-    Args:
-        data: Dict mapping instrument name to OHLCV DataFrame
-        asian_end_values: Unique asian_end time values from the grid
-        min_ticks_values: Unique min_range_ticks values from the grid
-        max_ticks_values: Unique max_range_ticks values from the grid
-
-    Returns:
-        Dict keyed by (instrument, asian_end_str, min_ticks, max_ticks)
-        mapping to a list of AsianRange objects that pass the filters
-    """
-    cache: dict[tuple[str, str, float, float | None], list[AsianRange]] = {}
-
-    for instrument, df in data.items():
-        tick_size = INSTRUMENTS[instrument]["tick_size"]
-
-        for asian_end in asian_end_values:
-            ae_str = asian_end.strftime("%H:%M")
-
-            # Compute ALL ranges with no filtering (min=0, max=None)
-            unfiltered_strategy = AsianRangeStrategy(
-                asian_end=asian_end,
-                min_range_ticks=0,
-                max_range_ticks=None,
-            )
-            all_ranges = unfiltered_strategy.find_asian_ranges(
-                df, instrument, tick_size,
-            )
-
-            # Filter by each (min_ticks, max_ticks) combination
-            for mn in min_ticks_values:
-                for mx in max_ticks_values:
-                    filtered = [
-                        r for r in all_ranges
-                        if r.range_ticks >= mn
-                        and (mx is None or r.range_ticks <= mx)
-                    ]
-                    cache[(instrument, ae_str, mn, mx)] = filtered
-
-    return cache
-
-
-def run_grid_search(
-    data: dict[str, pd.DataFrame],
-    param_grid: list[dict],
-    progress: bool = False,
-) -> pd.DataFrame:
-    """Run grid search over parameter combinations with precomputation.
-
-    Precomputes Asian ranges for each unique (instrument, asian_end) pair,
-    then filters by min/max ticks. This avoids redundant range scans —
-    only ``len(asian_end_values) × len(instruments)`` actual computations
-    instead of one per grid combination.
-
-    Args:
-        data: Dict mapping instrument name to OHLCV DataFrame
-        param_grid: List of parameter dicts (from build_param_grid())
-        progress: Whether to show a tqdm progress bar
-
-    Returns:
-        DataFrame with one row per parameter combination and metric columns
-    """
-    from .metrics import calculate_metrics
-
-    # Extract unique parameter values for precomputation
-    asian_end_values = sorted(
-        {p["asian_end"] for p in param_grid},
-        key=lambda t: (t.hour, t.minute),
-    )
-    min_ticks_values = sorted({p["min_range_ticks"] for p in param_grid})
-    max_ticks_values = sorted(
-        {p["max_range_ticks"] for p in param_grid},
-        key=lambda x: (0, x) if x is not None else (1, 0),
-    )
-
-    print(
-        f"  Precomputing Asian ranges for "
-        f"{len(asian_end_values)} asian_end values "
-        f"× {len(data)} instruments..."
-    )
-    range_cache = _precompute_asian_ranges(
-        data, asian_end_values, min_ticks_values, max_ticks_values,
-    )
-
-    # Precompute day groups for fast trade simulation
-    print("  Precomputing day groups...")
-    day_groups: dict[str, dict[pd.Timestamp, pd.DataFrame]] = {}
-    for instrument, df in data.items():
-        day_groups[instrument] = {
-            date: gdf for date, gdf in df.groupby(df.index.normalize())
-        }
-
-    # --- Precompute signals for each unique base combo ---
-    # Signals depend only on (mode, asian_end, trade_start, trade_end, min_range, max_range)
-    # There are only 324 unique base combos vs 4,050 total combos.
-    base_keys = set()
-    for p in param_grid:
-        ae_str = p["asian_end"].strftime("%H:%M")
-        ts_str = p["trade_start"].strftime("%H:%M")
-        te_str = p["trade_end"].strftime("%H:%M")
-        base_keys.add((p["mode"], ae_str, ts_str, te_str,
-                        p["min_range_ticks"], p["max_range_ticks"]))
-
-    print(f"  Precomputing signals for {len(base_keys)} base combos "
-          f"× {len(data)} instruments...")
-    # signal_cache: (instrument, mode, ae, ts, te, mn, mx) -> list[AsianSignal]
-    signal_cache: dict[tuple, list] = {}
-    for instrument, df in data.items():
-        inst_tz = df.index.tz
-        for mode, ae_str, ts_str, te_str, mn, mx in base_keys:
-            h, m = map(int, ae_str.split(":"))
-            h2, m2 = map(int, ts_str.split(":"))
-            h3, m3 = map(int, te_str.split(":"))
-            strategy_for_signals = AsianRangeStrategy(
-                mode=mode, asian_end=time(h, m),
-                trade_start=time(h2, m2), trade_end=time(h3, m3),
-                min_range_ticks=mn, max_range_ticks=mx,
-            )
-            ranges = range_cache.get((instrument, ae_str, mn, mx), [])
-            if not ranges:
-                signal_cache[(instrument, mode, ae_str, ts_str, te_str, mn, mx)] = []
-                continue
-            signals = strategy_for_signals.find_signals(df, ranges)
-            signal_cache[(instrument, mode, ae_str, ts_str, te_str, mn, mx)] = signals
-
-    print(f"  Done. Running {len(param_grid)} parameter combinations...")
-
-    results: list[dict] = []
-    iterator = tqdm(param_grid, desc="Grid search") if progress else param_grid
-
-    for params in iterator:
-        strategy = AsianRangeStrategy(**params)
-
-        ae_str = params["asian_end"].strftime("%H:%M")
-        ts_str = params["trade_start"].strftime("%H:%M")
-        te_str = params["trade_end"].strftime("%H:%M")
-        mn = params["min_range_ticks"]
-        mx = params["max_range_ticks"]
-
-        all_trades: list[Trade] = []
-
-        for instrument, df in data.items():
-            tick_size = INSTRUMENTS[instrument]["tick_size"]
-            tick_value = INSTRUMENTS[instrument]["tick_value"]
-
-            # Look up cached signals
-            signals = signal_cache.get(
-                (instrument, params["mode"], ae_str, ts_str, te_str, mn, mx), []
-            )
-            if not signals:
-                continue
-
-            # Simulate each signal (only exit params vary)
-            inst_day_groups = day_groups[instrument]
-            inst_tz = df.index.tz
-            for signal in signals:
-                lookup_date = signal.date
-                if inst_tz is not None and lookup_date.tz is None:
-                    lookup_date = lookup_date.tz_localize(inst_tz)
-                day_data = inst_day_groups.get(lookup_date)
-                if day_data is None:
-                    continue
-                trade = simulate_trade(
-                    signal, day_data, strategy,
-                    tick_size, tick_value,
-                )
-                if trade is not None:
-                    all_trades.append(trade)
-
-        metrics = calculate_metrics(all_trades)
-
-        results.append({
-            "mode": params["mode"],
-            "asian_end": ae_str,
-            "trade_start": params["trade_start"].strftime("%H:%M"),
-            "trade_end": params["trade_end"].strftime("%H:%M"),
-            "min_range_ticks": mn,
-            "max_range_ticks": mx,
-            "stop_type": params["stop_type"],
-            "tp_type": params["tp_type"],
-            "rr_ratio": params["rr_ratio"],
-            "stop_multiple": params["stop_multiple"],
-            "total_trades": metrics.get("total_trades", 0),
-            "win_rate": metrics.get("win_rate", 0),
-            "profit_factor": metrics.get("profit_factor", 0),
-            "total_pnl": metrics.get("total_pnl", 0),
-            "sharpe_ratio": metrics.get("sharpe_ratio", 0),
-            "max_drawdown": metrics.get("max_drawdown", 0),
-            "avg_pnl_per_trade": metrics.get("avg_pnl_per_trade", 0),
-            "pnl_long": metrics.get("pnl_long", 0),
-            "pnl_short": metrics.get("pnl_short", 0),
-        })
-
-    return pd.DataFrame(results)
-
-
-# ======================================================================
-# Walk-forward helpers
+# Walk-forward helper (module-level, used by run_walk_forward)
 # ======================================================================
 
 
@@ -936,7 +1227,35 @@ def _filter_data_by_date(
 
 
 # ======================================================================
-# Walk-forward analysis
+# Grid search (standalone, for backward compat)
+# ======================================================================
+
+
+def run_grid_search(
+    data: dict[str, pd.DataFrame],
+    param_grid: list[dict],
+    progress: bool = False,
+) -> pd.DataFrame:
+    """Run grid search over parameter combinations with precomputation.
+
+    Standalone backward-compatible wrapper. Delegates to
+    ``AsianRangeStrategy.run_grid_search()``.
+
+    Args:
+        data: Dict mapping instrument name to OHLCV DataFrame
+        param_grid: List of parameter dicts (from build_param_grid())
+        progress: Whether to show a tqdm progress bar
+
+    Returns:
+        DataFrame with one row per parameter combination and metric columns
+    """
+    return AsianRangeStrategy.run_grid_search(
+        data, param_grid, progress=progress,
+    )
+
+
+# ======================================================================
+# Walk-forward analysis (standalone, for backward compat)
 # ======================================================================
 
 
@@ -949,101 +1268,25 @@ def run_walk_forward(
 ) -> pd.DataFrame:
     """Rolling walk-forward analysis.
 
-    For each window:
-    1. Train: run grid search, select top_n by profit_factor (min 20 trades)
-    2. Test: evaluate top_n out-of-sample
-    3. Record IS and OOS metrics
+    Standalone backward-compatible wrapper. Delegates to
+    ``AsianRangeStrategy.run_walk_forward()``.
+
+    Args:
+        data: Dict mapping instrument name to OHLCV DataFrame
+        param_grid: List of parameter dicts (from build_param_grid())
+        train_months: Number of months for training window (default 24)
+        test_months: Number of months for test window (default 6)
+        top_n: Number of top parameter sets to evaluate OOS (default 10)
+
+    Returns:
+        DataFrame with walk-forward results
     """
-    from .metrics import calculate_metrics
-
-    tz = next(iter(data.values())).index.tz
-    global_start = max(df.index.min().date() for df in data.values())
-    global_end = min(df.index.max().date() for df in data.values())
-
-    # Build rolling windows
-    windows = []
-    current = global_start
-    while True:
-        train_start = pd.Timestamp(current, tz=tz)
-        train_end = train_start + pd.DateOffset(months=train_months)
-        test_start = train_end
-        test_end = test_start + pd.DateOffset(months=test_months)
-
-        if test_end.date() > global_end:
-            break
-
-        windows.append((train_start, train_end, test_start, test_end))
-        # Step by test_months — non-overlapping test windows, overlapping train windows
-        current = (train_start + pd.DateOffset(months=test_months)).date()
-
-    print(f"  {len(windows)} walk-forward windows")
-    wf_results = []
-
-    for wid, (train_start, train_end, test_start, test_end) in enumerate(windows):
-        print(f"\n  Window {wid}: train {train_start.date()}→{train_end.date()}, "
-              f"test {test_start.date()}→{test_end.date()}")
-
-        train_data = _filter_data_by_date(data, train_start, train_end)
-        test_data = _filter_data_by_date(data, test_start, test_end)
-
-        # In-sample grid search (no progress bar)
-        is_results = run_grid_search(train_data, param_grid)
-        if is_results.empty:
-            continue
-
-        # Filter: minimum 20 trades
-        qualified = is_results[is_results["total_trades"] >= 20]
-        if qualified.empty:
-            continue
-
-        # Select top N by profit factor
-        top_params = qualified.nlargest(top_n, "profit_factor")
-
-        # Evaluate OOS
-        for _, row in top_params.iterrows():
-            # Reconstruct params — convert string times back to time objects
-            h, m = map(int, row["asian_end"].split(":"))
-            ae = time(h, m)
-            h, m = map(int, row["trade_start"].split(":"))
-            ts = time(h, m)
-            h, m = map(int, row["trade_end"].split(":"))
-            te = time(h, m)
-
-            max_rt = None if pd.isna(row["max_range_ticks"]) else int(row["max_range_ticks"])
-
-            params = {
-                "mode": row["mode"],
-                "asian_end": ae,
-                "trade_start": ts,
-                "trade_end": te,
-                "min_range_ticks": int(row["min_range_ticks"]),
-                "max_range_ticks": max_rt,
-                "stop_type": row["stop_type"],
-                "tp_type": row["tp_type"],
-                "rr_ratio": float(row["rr_ratio"]),
-                "stop_multiple": float(row["stop_multiple"]),
-            }
-
-            strategy = AsianRangeStrategy(**params)
-            oos_trades = run_backtest(test_data, strategy)
-            oos_metrics = calculate_metrics(oos_trades)
-
-            wf_results.append({
-                "window_id": wid,
-                "train_start": train_start.date(),
-                "train_end": train_end.date(),
-                "test_start": test_start.date(),
-                "test_end": test_end.date(),
-                "params": json.dumps({k: str(v) for k, v in params.items()}),
-                "is_pnl": row["total_pnl"],
-                "oos_pnl": oos_metrics.get("total_pnl", 0),
-                "is_sharpe": row["sharpe_ratio"],
-                "oos_sharpe": oos_metrics.get("sharpe_ratio", 0),
-                "is_pf": row["profit_factor"],
-                "oos_pf": oos_metrics.get("profit_factor", 0),
-            })
-
-    return pd.DataFrame(wf_results)
+    return AsianRangeStrategy.run_walk_forward(
+        data, param_grid,
+        train_months=train_months,
+        test_months=test_months,
+        top_n=top_n,
+    )
 
 
 # ======================================================================
