@@ -11,13 +11,13 @@ if TYPE_CHECKING:
 
 
 def calculate_metrics(trades: list[Trade]) -> dict:
-    """Calcule toutes les métriques de performance.
+    """Calculate all performance metrics.
 
-    Métriques calculées :
-    - Win rate, profit factor, total PnL, PnL moyen
-    - Max drawdown, Sharpe ratio (annualisé, 252 jours)
-    - Performance par session, par instrument, par jour de la semaine
-    - Distribution des raisons de sortie
+    Metrics computed:
+    - Win rate, profit factor, total PnL, average PnL
+    - Max drawdown, Sharpe ratio (annualized, 252 days)
+    - Performance by session, instrument, and day of week
+    - Exit reason distribution
     """
     if not trades:
         return {"total_trades": 0}
@@ -52,12 +52,12 @@ def calculate_metrics(trades: list[Trade]) -> dict:
     total_pnl = df["pnl_dollars"].sum()
     avg_pnl = df["pnl_dollars"].mean()
 
-    # Max drawdown (sur la courbe de PnL cumulé, ordre chronologique)
+    # Max drawdown (on cumulative PnL curve, chronological order)
     df_sorted = df.sort_values("entry_time")
     cumulative = df_sorted["pnl_dollars"].cumsum()
     max_drawdown = (cumulative - cumulative.cummax()).min()
 
-    # Sharpe ratio annualisé
+    # Annualized Sharpe ratio
     df["entry_date"] = df["entry_time"].dt.date
     daily_pnl = df.groupby("entry_date")["pnl_dollars"].sum()
     if len(daily_pnl) > 1 and daily_pnl.std() > 0:
@@ -65,33 +65,33 @@ def calculate_metrics(trades: list[Trade]) -> dict:
     else:
         sharpe = 0.0
 
-    # Performance par session
+    # Performance by session
     _agg = {"trades": "count", "total": "sum", "moyenne": "mean"}
     by_session = df.groupby("session")["pnl_dollars"].agg(**_agg)
     by_session["win_rate"] = df.groupby("session")["pnl_dollars"].apply(
         lambda x: (x > 0).mean()
     )
 
-    # Performance par instrument
+    # Performance by instrument
     by_instrument = df.groupby("instrument")["pnl_dollars"].agg(**_agg)
     by_instrument["win_rate"] = df.groupby("instrument")["pnl_dollars"].apply(
         lambda x: (x > 0).mean()
     )
 
-    # Performance par jour de la semaine
+    # Performance by day of week
     df["weekday"] = pd.to_datetime(df["date"]).dt.day_name()
     by_weekday = df.groupby("weekday")["pnl_dollars"].agg(**_agg)
     by_weekday["win_rate"] = df.groupby("weekday")["pnl_dollars"].apply(
         lambda x: (x > 0).mean()
     )
-    # Ordonner lundi → vendredi
+    # Order Monday → Friday
     day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
     by_weekday = by_weekday.reindex([d for d in day_order if d in by_weekday.index])
 
-    # Distribution des raisons de sortie
+    # Exit reason distribution
     exit_reasons = df["exit_reason"].value_counts()
 
-    # Performance par direction
+    # Performance by direction
     long_trades = df[df["direction"] == "long"]
     short_trades = df[df["direction"] == "short"]
 
@@ -117,34 +117,34 @@ def calculate_metrics(trades: list[Trade]) -> dict:
 
 
 def print_report(metrics: dict) -> None:
-    """Affiche un rapport formaté des métriques de backtest."""
+    """Print a formatted backtest report."""
     if metrics.get("total_trades", 0) == 0:
-        print("Aucun trade exécuté.")
+        print("No trades executed.")
         return
 
     print()
     print("=" * 60)
-    print("  RAPPORT DE BACKTEST — SRS (Session Range Strategy)")
+    print("  BACKTEST REPORT")
     print("=" * 60)
 
-    print(f"\n  Nombre total de trades : {metrics['total_trades']}")
+    print(f"\n  Total trades          : {metrics['total_trades']}")
     print(f"  Win rate              : {metrics['win_rate']:.1%}")
     print(f"  Profit factor         : {metrics['profit_factor']:.2f}")
-    print(f"  PnL total             : ${metrics['total_pnl']:>10,.2f}")
-    print(f"  PnL moyen par trade   : ${metrics['avg_pnl_per_trade']:>10,.2f}")
+    print(f"  Total PnL             : ${metrics['total_pnl']:>10,.2f}")
+    print(f"  Avg PnL per trade     : ${metrics['avg_pnl_per_trade']:>10,.2f}")
     print(f"  Max drawdown          : ${metrics['max_drawdown']:>10,.2f}")
     print(f"  Sharpe ratio          : {metrics['sharpe_ratio']:.2f}")
 
-    print("\n  --- Performance par session ---")
+    print("\n  --- Performance by session ---")
     print(metrics["by_session"].to_string())
 
-    print("\n  --- Performance par instrument ---")
+    print("\n  --- Performance by instrument ---")
     print(metrics["by_instrument"].to_string())
 
-    print("\n  --- Performance par jour de la semaine ---")
+    print("\n  --- Performance by day of week ---")
     print(metrics["by_weekday"].to_string())
 
-    print("\n  --- Raisons de sortie ---")
+    print("\n  --- Exit reasons ---")
     for reason, count in metrics["exit_reasons"].items():
         pct = count / metrics["total_trades"] * 100
         print(f"  {reason:<16} : {count:>5}  ({pct:.1f}%)")

@@ -24,3 +24,10 @@ results/
 # IDE
 .vscode/
 .idea/
+
+# Claude Code / tooling state
+CLAUDE.md
+.omc/
+.serena/
+.pytest_cache/
+docs/superpowers/
