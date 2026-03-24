@@ -31,3 +31,8 @@ CLAUDE.md
 .serena/
 .pytest_cache/
 docs/superpowers/
+
+# Private strategies (local only)
+run_asian.py
+src/strategies/asian_range.py
+tests/test_strategy_asian.py

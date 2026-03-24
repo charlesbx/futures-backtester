@@ -9,7 +9,7 @@ Usage:
 
 Examples:
     python run.py srs
-    python run.py asian_range --optimize
+    python run.py srs --optimize
     python run.py intmom --walk-forward
     python run.py gapfade --report
 """

@@ -16,7 +16,6 @@ A strategy-agnostic backtesting engine for micro E-mini futures (MES/MNQ), with 
 | Strategy | Description |
 |----------|-------------|
 | `srs` | Session Range Strategy — 30-min opening range breakout at 9:00 AM / 12:00 PM ET |
-| `asian_range` | Asian session range breakout/fade during US hours |
 | `intmom` | Intraday momentum — trend continuation signals |
 | `gapfade` | Overnight gap fade — mean reversion on open gaps |
 
@@ -57,7 +56,7 @@ python run.py --list
 python run.py srs
 
 # Run grid search optimization
-python run.py asian_range --optimize
+python run.py srs --optimize
 
 # Run walk-forward validation
 python run.py intmom --walk-forward
@@ -130,7 +129,6 @@ src/
 └── strategies/        # Strategy plugins (auto-discovered)
     ├── __init__.py    # Registry: get_strategy(), list_strategies()
     ├── srs.py         # Session Range Strategy
-    ├── asian_range.py # Asian Range Breakout/Fade
     ├── intmom.py      # Intraday Momentum
     └── gapfade.py     # Overnight Gap Fade
 ```
