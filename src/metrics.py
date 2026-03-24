@@ -4,10 +4,45 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import numpy as np
 import pandas as pd
 
 if TYPE_CHECKING:
     from .trade import Trade
+
+
+def _bootstrap_ci(trades_pnl: pd.Series, n_boot: int = 1000, ci: float = 0.95) -> dict:
+    """Bootstrap confidence intervals for profit factor and Sharpe ratio."""
+    rng = np.random.default_rng(42)
+    n = len(trades_pnl)
+    if n < 10:
+        return {"pf_ci_low": 0.0, "pf_ci_high": 0.0, "sharpe_ci_low": 0.0, "sharpe_ci_high": 0.0}
+
+    pf_samples = []
+    sharpe_samples = []
+
+    for _ in range(n_boot):
+        sample = trades_pnl.iloc[rng.integers(0, n, size=n)]
+        gross_win = sample[sample > 0].sum()
+        gross_loss = abs(sample[sample <= 0].sum())
+        pf = gross_win / gross_loss if gross_loss > 0 else 0.0
+        pf_samples.append(pf)
+
+        if sample.std() > 0:
+            sharpe_samples.append(sample.mean() / sample.std() * (252 ** 0.5))
+        else:
+            sharpe_samples.append(0.0)
+
+    alpha = (1 - ci) / 2
+    pf_arr = np.array(pf_samples)
+    sh_arr = np.array(sharpe_samples)
+
+    return {
+        "pf_ci_low": float(np.percentile(pf_arr, alpha * 100)),
+        "pf_ci_high": float(np.percentile(pf_arr, (1 - alpha) * 100)),
+        "sharpe_ci_low": float(np.percentile(sh_arr, alpha * 100)),
+        "sharpe_ci_high": float(np.percentile(sh_arr, (1 - alpha) * 100)),
+    }
 
 
 def calculate_metrics(trades: list[Trade]) -> dict:
@@ -65,6 +100,35 @@ def calculate_metrics(trades: list[Trade]) -> dict:
     else:
         sharpe = 0.0
 
+    # Bootstrap confidence intervals for profit factor and Sharpe
+    bootstrap = _bootstrap_ci(df["pnl_dollars"])
+
+    # Profit concentration: % of total PnL from top 10% of trades (by absolute PnL)
+    top_10pct_count = max(1, int(len(df) * 0.1))
+    sorted_by_pnl = df["pnl_dollars"].abs().sort_values(ascending=False)
+    top_10pct_pnl = df.loc[sorted_by_pnl.head(top_10pct_count).index, "pnl_dollars"].sum()
+    profit_concentration = abs(top_10pct_pnl / total_pnl) if total_pnl != 0 else 0.0
+
+    # Drawdown duration: max consecutive trades where cumulative PnL was below its high-water mark
+    cumulative = df_sorted["pnl_dollars"].cumsum()
+    underwater = cumulative < cumulative.cummax()
+    if underwater.any():
+        # Group consecutive underwater periods
+        groups = (~underwater).cumsum()
+        underwater_groups = underwater.groupby(groups).sum()
+        max_dd_days = int(underwater_groups.max()) if len(underwater_groups) > 0 else 0
+    else:
+        max_dd_days = 0
+
+    # Monthly PnL breakdown
+    df_sorted["month"] = df_sorted["entry_time"].dt.to_period("M").astype(str)
+    by_month = df_sorted.groupby("month")["pnl_dollars"].agg(
+        trades="count", total="sum", moyenne="mean"
+    )
+    by_month["win_rate"] = df_sorted.groupby("month")["pnl_dollars"].apply(
+        lambda x: (x > 0).mean()
+    )
+
     # Performance by session
     _agg = {"trades": "count", "total": "sum", "moyenne": "mean"}
     by_session = df.groupby("session")["pnl_dollars"].agg(**_agg)
@@ -113,6 +177,13 @@ def calculate_metrics(trades: list[Trade]) -> dict:
         "trades_short": len(short_trades),
         "win_rate_long": (long_trades["pnl_dollars"] > 0).mean() if len(long_trades) > 0 else 0.0,
         "win_rate_short": (short_trades["pnl_dollars"] > 0).mean() if len(short_trades) > 0 else 0.0,
+        "profit_concentration": profit_concentration,
+        "max_dd_duration_trades": max_dd_days,
+        "by_month": by_month,
+        "pf_ci_low": bootstrap["pf_ci_low"],
+        "pf_ci_high": bootstrap["pf_ci_high"],
+        "sharpe_ci_low": bootstrap["sharpe_ci_low"],
+        "sharpe_ci_high": bootstrap["sharpe_ci_high"],
     }
 
 

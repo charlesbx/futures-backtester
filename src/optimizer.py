@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING
 
+import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
@@ -24,6 +25,10 @@ METRIC_COLUMNS = [
     "avg_pnl_per_trade", "max_drawdown", "sharpe_ratio",
     "pnl_long", "pnl_short", "trades_long", "trades_short",
     "win_rate_long", "win_rate_short",
+    "profit_concentration",
+    "pf_ci_low", "pf_ci_high",
+    "sharpe_ci_low", "sharpe_ci_high",
+    "max_dd_duration_trades",
 ]
 
 
@@ -62,6 +67,48 @@ def generic_grid_search(
         rows.append(row)
 
     return pd.DataFrame(rows)
+
+
+def apply_fdr_correction(grid_results: pd.DataFrame, alpha: float = 0.05) -> pd.DataFrame:
+    """Apply Benjamini-Hochberg FDR correction to grid search results.
+
+    Adds 'fdr_significant' column: True if the result survives correction.
+    Uses a simple heuristic: profit factor significantly > 1.0 based on
+    trade count and win rate variance.
+    """
+    from scipy import stats
+
+    df = grid_results.copy()
+    p_values = []
+
+    for _, row in df.iterrows():
+        n = int(row.get("total_trades", 0))
+        pf = row.get("profit_factor", 0)
+        wr = row.get("win_rate", 0)
+
+        if n < 10 or pf <= 0:
+            p_values.append(1.0)
+            continue
+
+        # Test if win rate is significantly different from 50% using binomial test
+        wins = int(round(wr * n))
+        p = stats.binom_test(wins, n, 0.5, alternative="greater") if n > 0 else 1.0
+        p_values.append(p)
+
+    df["p_value"] = p_values
+
+    # Benjamini-Hochberg procedure
+    n_tests = len(df)
+    if n_tests > 0:
+        sorted_idx = np.argsort(p_values)
+        ranks = np.empty_like(sorted_idx)
+        ranks[sorted_idx] = np.arange(1, n_tests + 1)
+        thresholds = alpha * ranks / n_tests
+        df["fdr_significant"] = df["p_value"] <= thresholds
+    else:
+        df["fdr_significant"] = False
+
+    return df
 
 
 def generic_walk_forward(
@@ -158,7 +205,23 @@ def generic_walk_forward(
                 "oos_pf": oos_metrics.get("profit_factor", 0),
             })
 
-    return pd.DataFrame(rows)
+    result_df = pd.DataFrame(rows)
+
+    if not result_df.empty:
+        # OOS consistency metrics
+        by_window = result_df.groupby("window_id").agg(
+            oos_pf_mean=("oos_pf", "mean"),
+            oos_pnl_sum=("oos_pnl", "sum"),
+        )
+        result_df.attrs["oos_windows_total"] = int(by_window.shape[0])
+        result_df.attrs["oos_windows_profitable"] = int((by_window["oos_pnl_sum"] > 0).sum())
+        result_df.attrs["oos_win_rate"] = float((by_window["oos_pnl_sum"] > 0).mean())
+        result_df.attrs["oos_pf_mean"] = float(result_df["oos_pf"].mean())
+        result_df.attrs["oos_pf_std"] = float(result_df["oos_pf"].std())
+        result_df.attrs["oos_pf_min"] = float(result_df["oos_pf"].min())
+        result_df.attrs["oos_pf_max"] = float(result_df["oos_pf"].max())
+
+    return result_df
 
 
 def default_report(
@@ -243,6 +306,16 @@ def default_report(
             f"  OOS positive    : {oos_pos}/{len(wf_results)} "
             f"({oos_pos / len(wf_results):.1%})"
         )
+
+    # ── 5. OOS CONSISTENCY ──
+    if has_wf and hasattr(wf_results, 'attrs') and wf_results.attrs.get("oos_windows_total"):
+        section("5. OOS CONSISTENCY")
+        a = wf_results.attrs
+        lines.append(f"  Windows total   : {a['oos_windows_total']}")
+        lines.append(f"  Windows profit. : {a['oos_windows_profitable']} ({a['oos_win_rate']:.1%})")
+        lines.append(f"  OOS PF mean     : {a['oos_pf_mean']:.3f}")
+        lines.append(f"  OOS PF std      : {a['oos_pf_std']:.3f}")
+        lines.append(f"  OOS PF range    : {a['oos_pf_min']:.3f} — {a['oos_pf_max']:.3f}")
 
     # ── SUMMARY ──
     lines.extend(["", SEP])
