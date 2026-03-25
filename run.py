@@ -71,15 +71,20 @@ def cmd_baseline(strategy_cls, args):
             print(f"  {key:<25} {val:>12}")
     print(f"{'='*50}")
 
-    # Save
+    # Save full metrics (serialize DataFrames/Series to dicts)
     RESULTS_DIR.mkdir(exist_ok=True)
-    baseline = {k: metrics.get(k, 0) for k in [
-        "total_trades", "win_rate", "profit_factor", "total_pnl",
-        "sharpe_ratio", "max_drawdown", "avg_pnl_per_trade",
-    ]}
+    import pandas as pd
+    baseline = {}
+    for k, v in metrics.items():
+        if isinstance(v, (pd.DataFrame, pd.Series)):
+            baseline[k] = v.to_dict()
+        elif isinstance(v, (float, int, str, bool, type(None))):
+            baseline[k] = v
+        else:
+            baseline[k] = str(v)
     path = RESULTS_DIR / f"{strategy_cls.name}_baseline.json"
     with open(path, "w") as f:
-        json.dump(baseline, f, indent=2)
+        json.dump(baseline, f, indent=2, default=str)
     print(f"\n  Saved to {path}")
 
 
