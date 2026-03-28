@@ -8,6 +8,9 @@ for performance optimizations (e.g. precomputing signals).
 from __future__ import annotations
 
 import json
+import os
+import time
+from itertools import product
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -37,6 +40,14 @@ def _extract_metrics(metrics: dict) -> dict:
     return {k: metrics.get(k, 0) for k in METRIC_COLUMNS}
 
 
+def _write_progress(progress_file: str, data: dict) -> None:
+    """Atomically write progress JSON (write to .tmp then rename)."""
+    tmp = progress_file + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, progress_file)
+
+
 def generic_grid_search(
     strategy_cls: type[BaseStrategy],
     data: dict[str, pd.DataFrame],
@@ -44,6 +55,7 @@ def generic_grid_search(
     slippage_ticks: float = 1,
     commission: float = 1.24,
     progress: bool = True,
+    progress_file: str | None = None,
 ) -> pd.DataFrame:
     """Naive grid search — runs full backtest for each param combination.
 
@@ -53,18 +65,186 @@ def generic_grid_search(
     if param_grid is None:
         param_grid = strategy_cls.build_param_grid()
 
+    total = len(param_grid)
     rows: list[dict] = []
+    best_pf = 0.0
+    start_time = time.time()
+
     iterator = (
         tqdm(param_grid, desc=f"Grid search ({strategy_cls.name})")
         if progress else param_grid
     )
 
-    for params in iterator:
+    for i, params in enumerate(iterator):
         strategy = strategy_cls.from_params(params)
         trades = run_backtest(strategy, data, slippage_ticks, commission)
         metrics = calculate_metrics(trades)
         row = {**strategy.to_params(), **_extract_metrics(metrics)}
         rows.append(row)
+
+        pf = row.get("profit_factor", 0)
+        if pf > best_pf:
+            best_pf = pf
+
+        if progress_file and (i + 1) % 10 == 0:
+            elapsed = time.time() - start_time
+            rate = (i + 1) / elapsed if elapsed > 0 else 0
+            remaining = (total - i - 1) / rate if rate > 0 else 0
+            _write_progress(progress_file, {
+                "phase": "grid_search",
+                "total_combos": total,
+                "phase_combos": total,
+                "completed": i + 1,
+                "pct_complete": round((i + 1) / total * 100, 1),
+                "best_pf_so_far": round(best_pf, 4),
+                "elapsed_seconds": round(elapsed),
+                "estimated_remaining_seconds": round(remaining),
+            })
+
+    return pd.DataFrame(rows)
+
+
+def coarse_to_fine_grid_search(
+    strategy_cls: type[BaseStrategy],
+    data: dict[str, pd.DataFrame],
+    param_grid: list[dict] | None = None,
+    slippage_ticks: float = 1,
+    commission: float = 1.24,
+    coarse_stride: int = 3,
+    top_n: int = 5,
+    early_exit_pf: float = 1.0,
+    early_exit_pct: float = 0.25,
+    progress_file: str | None = None,
+    progress: bool = True,
+) -> pd.DataFrame:
+    """Two-phase grid search: coarse sweep then fine-tune around top results.
+
+    Phase 1 (Coarse): Test every ``coarse_stride``-th combination.
+    Early exit if first ``early_exit_pct`` of coarse combos all have
+    PF <= ``early_exit_pf``.
+    Phase 2 (Fine): Build neighborhood grids around top ``top_n`` coarse
+    results using adjacent parameter values from the original grid.
+
+    Returns a DataFrame in the same format as ``generic_grid_search()``.
+    """
+    if param_grid is None:
+        param_grid = strategy_cls.build_param_grid()
+
+    # --- Phase 1: Coarse ---
+    coarse_grid = param_grid[::coarse_stride]
+    coarse_total = len(coarse_grid)
+    early_exit_threshold = max(1, int(coarse_total * early_exit_pct))
+
+    rows: list[dict] = []
+    best_pf = 0.0
+    start_time = time.time()
+
+    iterator = (
+        tqdm(coarse_grid, desc=f"Coarse search ({strategy_cls.name})")
+        if progress else coarse_grid
+    )
+
+    for i, params in enumerate(iterator):
+        strategy = strategy_cls.from_params(params)
+        trades = run_backtest(strategy, data, slippage_ticks, commission)
+        metrics = calculate_metrics(trades)
+        row = {**strategy.to_params(), **_extract_metrics(metrics)}
+        rows.append(row)
+
+        pf = row.get("profit_factor", 0)
+        if pf > best_pf:
+            best_pf = pf
+
+        if progress_file and (i + 1) % 10 == 0:
+            elapsed = time.time() - start_time
+            rate = (i + 1) / elapsed if elapsed > 0 else 0
+            remaining = (coarse_total - i - 1) / rate if rate > 0 else 0
+            _write_progress(progress_file, {
+                "phase": "coarse",
+                "total_combos": len(param_grid),
+                "phase_combos": coarse_total,
+                "completed": i + 1,
+                "pct_complete": round((i + 1) / coarse_total * 100, 1),
+                "best_pf_so_far": round(best_pf, 4),
+                "elapsed_seconds": round(elapsed),
+                "estimated_remaining_seconds": round(remaining),
+            })
+
+        # Early exit check after first early_exit_pct of coarse combos
+        if (i + 1) == early_exit_threshold and best_pf <= early_exit_pf:
+            if progress:
+                tqdm.write(
+                    f"Early exit: no PF > {early_exit_pf} after "
+                    f"{early_exit_threshold}/{coarse_total} coarse combos"
+                )
+            return pd.DataFrame(rows)
+
+    coarse_df = pd.DataFrame(rows)
+
+    # --- Phase 2: Fine ---
+    # Build unique sorted values per parameter from the original grid
+    param_names = list(param_grid[0].keys())
+    param_values: dict[str, list] = {}
+    for name in param_names:
+        param_values[name] = sorted(set(p[name] for p in param_grid))
+
+    # Track already-tested combos to avoid duplicates
+    tested = {tuple(sorted(p.items())) for p in coarse_grid}
+
+    top_results = coarse_df.nlargest(top_n, "profit_factor")
+    fine_grid: list[dict] = []
+
+    for _, top_row in top_results.iterrows():
+        neighborhood: dict[str, list] = {}
+        for name in param_names:
+            val = top_row[name]
+            vals = param_values[name]
+            # Find closest index (handles floating point)
+            idx = min(range(len(vals)), key=lambda j: abs(vals[j] - val))
+            neighborhood[name] = vals[max(0, idx - 1):idx + 2]
+
+        for combo_values in product(*[neighborhood[n] for n in param_names]):
+            combo = dict(zip(param_names, combo_values))
+            key = tuple(sorted(combo.items()))
+            if key not in tested:
+                tested.add(key)
+                fine_grid.append(combo)
+
+    if fine_grid:
+        fine_total = len(fine_grid)
+        fine_start = time.time()
+
+        fine_iterator = (
+            tqdm(fine_grid, desc=f"Fine search ({strategy_cls.name})")
+            if progress else fine_grid
+        )
+
+        for i, params in enumerate(fine_iterator):
+            strategy = strategy_cls.from_params(params)
+            trades = run_backtest(strategy, data, slippage_ticks, commission)
+            metrics = calculate_metrics(trades)
+            row = {**strategy.to_params(), **_extract_metrics(metrics)}
+            rows.append(row)
+
+            pf = row.get("profit_factor", 0)
+            if pf > best_pf:
+                best_pf = pf
+
+            if progress_file and (i + 1) % 10 == 0:
+                elapsed = time.time() - start_time
+                fine_elapsed = time.time() - fine_start
+                rate = (i + 1) / fine_elapsed if fine_elapsed > 0 else 0
+                remaining = (fine_total - i - 1) / rate if rate > 0 else 0
+                _write_progress(progress_file, {
+                    "phase": "fine",
+                    "total_combos": len(param_grid),
+                    "phase_combos": fine_total,
+                    "completed": i + 1,
+                    "pct_complete": round((i + 1) / fine_total * 100, 1),
+                    "best_pf_so_far": round(best_pf, 4),
+                    "elapsed_seconds": round(elapsed),
+                    "estimated_remaining_seconds": round(remaining),
+                })
 
     return pd.DataFrame(rows)
 
@@ -92,7 +272,7 @@ def apply_fdr_correction(grid_results: pd.DataFrame, alpha: float = 0.05) -> pd.
 
         # Test if win rate is significantly different from 50% using binomial test
         wins = int(round(wr * n))
-        p = stats.binom_test(wins, n, 0.5, alternative="greater") if n > 0 else 1.0
+        p = stats.binomtest(wins, n, 0.5, alternative="greater").pvalue if n > 0 else 1.0
         p_values.append(p)
 
     df["p_value"] = p_values
@@ -120,6 +300,7 @@ def generic_walk_forward(
     top_n: int = 10,
     slippage_ticks: float = 1,
     commission: float = 1.24,
+    progress_file: str | None = None,
 ) -> pd.DataFrame:
     """Rolling walk-forward analysis.
 
@@ -155,6 +336,7 @@ def generic_walk_forward(
 
     param_cols = strategy_cls.param_columns()
     rows: list[dict] = []
+    wf_start_time = time.time()
 
     for wid, (train_start, train_end, test_start, test_end) in enumerate(
         tqdm(windows, desc="Walk-forward")
@@ -203,6 +385,21 @@ def generic_walk_forward(
                 "oos_sharpe": oos_metrics.get("sharpe_ratio", 0),
                 "is_pf": is_row.get("profit_factor", 0),
                 "oos_pf": oos_metrics.get("profit_factor", 0),
+            })
+
+        if progress_file:
+            completed = wid + 1
+            total_windows = len(windows)
+            elapsed = time.time() - wf_start_time
+            rate = completed / elapsed if elapsed > 0 else 0
+            remaining = (total_windows - completed) / rate if rate > 0 else 0
+            _write_progress(progress_file, {
+                "phase": "walk_forward",
+                "total_windows": total_windows,
+                "completed_windows": completed,
+                "pct_complete": round(completed / total_windows * 100, 1),
+                "elapsed_seconds": round(elapsed),
+                "estimated_remaining_seconds": round(remaining),
             })
 
     result_df = pd.DataFrame(rows)

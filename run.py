@@ -96,8 +96,25 @@ def cmd_optimize(strategy_cls, args):
     param_grid = strategy_cls.build_param_grid()
     print(f"  {len(param_grid)} combinations")
 
-    print(f"\nRunning grid search ({strategy_cls.name})...")
-    results = strategy_cls.run_grid_search(data, param_grid, progress=True)
+    if args.coarse_to_fine:
+        from src.optimizer import coarse_to_fine_grid_search
+
+        print(f"\nRunning coarse-to-fine grid search ({strategy_cls.name})...")
+        results = coarse_to_fine_grid_search(
+            strategy_cls, data, param_grid,
+            progress_file=args.progress_file,
+        )
+    elif args.progress_file:
+        from src.optimizer import generic_grid_search
+
+        print(f"\nRunning grid search ({strategy_cls.name})...")
+        results = generic_grid_search(
+            strategy_cls, data, param_grid,
+            progress_file=args.progress_file,
+        )
+    else:
+        print(f"\nRunning grid search ({strategy_cls.name})...")
+        results = strategy_cls.run_grid_search(data, param_grid, progress=True)
 
     RESULTS_DIR.mkdir(exist_ok=True)
     path = RESULTS_DIR / f"{strategy_cls.name}_grid.csv"
@@ -121,7 +138,15 @@ def cmd_walk_forward(strategy_cls, args):
     print(f"  {len(param_grid)} combinations")
 
     print(f"\nRunning walk-forward ({strategy_cls.name}, 24-month train, 6-month test)...")
-    wf_results = strategy_cls.run_walk_forward(data, param_grid)
+    if args.progress_file:
+        from src.optimizer import generic_walk_forward
+
+        wf_results = generic_walk_forward(
+            strategy_cls, data, param_grid,
+            progress_file=args.progress_file,
+        )
+    else:
+        wf_results = strategy_cls.run_walk_forward(data, param_grid)
 
     RESULTS_DIR.mkdir(exist_ok=True)
     path = RESULTS_DIR / f"{strategy_cls.name}_wf.csv"
@@ -177,7 +202,14 @@ def main():
                        help="Run walk-forward analysis")
     group.add_argument("--report", action="store_true",
                        help="Generate report from saved results")
+    parser.add_argument("--coarse-to-fine", action="store_true",
+                        help="Use coarse-to-fine two-phase grid search (requires --optimize)")
+    parser.add_argument("--progress-file", type=str, default=None,
+                        help="Write optimization progress to JSON file")
     args = parser.parse_args()
+
+    if args.coarse_to_fine and not args.optimize:
+        parser.error("--coarse-to-fine requires --optimize")
 
     if args.list:
         print("Available strategies:")
